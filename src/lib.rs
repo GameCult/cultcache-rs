@@ -103,7 +103,7 @@ impl CacheBackingStore for SingleFileMessagePackBackingStore {
         let mut entries = self.pull_all()?;
         entries.retain(|candidate| entry_id(candidate) != entry_id(entry));
         entries.push(entry.clone());
-        entries.sort_by(|left, right| entry_id(left).cmp(&entry_id(right)));
+        entries.sort_by_key(entry_id);
         self.write_all(&entries)
     }
 
@@ -115,7 +115,7 @@ impl CacheBackingStore for SingleFileMessagePackBackingStore {
 
     fn push_all(&mut self, entries: &[CultCacheEnvelope], _options: PushAllOptions) -> Result<()> {
         let mut entries = entries.to_vec();
-        entries.sort_by(|left, right| entry_id(left).cmp(&entry_id(right)));
+        entries.sort_by_key(entry_id);
         self.write_all(&entries)
     }
 }
