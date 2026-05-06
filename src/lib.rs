@@ -302,6 +302,16 @@ impl CultCache {
             .ok_or_else(|| anyhow!("CultCache has no {:?} entry at key {:?}", T::TYPE, key))
     }
 
+    pub fn get_envelope<T: DatabaseEntry>(&self, key: &str) -> Result<Option<CultCacheEnvelope>> {
+        self.require_entry_type::<T>()?;
+        Ok(self.entries.get(&entry_id_parts(T::TYPE, key)).cloned())
+    }
+
+    pub fn get_required_envelope<T: DatabaseEntry>(&self, key: &str) -> Result<CultCacheEnvelope> {
+        self.get_envelope::<T>(key)?
+            .ok_or_else(|| anyhow!("CultCache has no {:?} envelope at key {:?}", T::TYPE, key))
+    }
+
     pub fn get_all<T: DatabaseEntry>(&self) -> Result<Vec<T>> {
         self.require_entry_type::<T>()?;
         let mut values = Vec::new();
@@ -346,6 +356,51 @@ impl CultCache {
             payload,
             stored_at: now_utc_second(),
         };
+        let route = self.resolve_route_indices(T::TYPE);
+        let Some(primary_index) = route.first().copied() else {
+            return Err(anyhow!(
+                "No backing store is registered for entry type {:?}",
+                T::TYPE
+            ));
+        };
+        self.stores[primary_index].store.push(&entry)?;
+        for mirror_index in route.iter().skip(1).copied() {
+            self.stores[mirror_index].store.push(&entry)?;
+        }
+        self.entries.insert(entry_id(&entry), entry);
+        Ok(parsed)
+    }
+
+    pub fn put_envelope<T: DatabaseEntry>(&mut self, entry: CultCacheEnvelope) -> Result<T> {
+        self.require_entry_type::<T>()?;
+        if entry.r#type != T::TYPE {
+            return Err(anyhow!(
+                "CultCache envelope type {:?} does not match registered Rust type {:?}",
+                entry.r#type,
+                T::TYPE
+            ));
+        }
+        if entry.key.trim().is_empty() {
+            return Err(anyhow!(
+                "CultCache envelope keys for type {:?} must be non-empty",
+                T::TYPE
+            ));
+        }
+        if entry.stored_at.trim().is_empty() {
+            return Err(anyhow!(
+                "CultCache envelope stored_at for type {:?} must be non-empty",
+                T::TYPE
+            ));
+        }
+
+        let parsed: T = rmp_serde::from_slice(&entry.payload).with_context(|| {
+            format!(
+                "failed to validate CultCache envelope {:?} at key {:?} as {}",
+                T::TYPE,
+                entry.key,
+                T::SCHEMA_NAME
+            )
+        })?;
         let route = self.resolve_route_indices(T::TYPE);
         let Some(primary_index) = route.first().copied() else {
             return Err(anyhow!(
@@ -654,6 +709,45 @@ mod tests {
             error
                 .to_string()
                 .contains("failed to decode CultCache entry")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn put_envelope_reuses_existing_messagepack_payload() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let origin_store = temp.path().join("origin.msgpack");
+        let target_store = temp.path().join("target.msgpack");
+
+        let mut origin = CultCache::new();
+        origin.register_entry_type::<Settings>()?;
+        origin.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&origin_store));
+        origin.put(
+            "app",
+            &Settings {
+                theme: "ash".to_string(),
+                retries: 3,
+            },
+        )?;
+
+        let envelope = origin.get_required_envelope::<Settings>("app")?;
+
+        let mut target = CultCache::new();
+        target.register_entry_type::<Settings>()?;
+        target.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&target_store));
+        let applied = target.put_envelope::<Settings>(envelope.clone())?;
+
+        assert_eq!(
+            applied,
+            Settings {
+                theme: "ash".to_string(),
+                retries: 3,
+            }
+        );
+        assert_eq!(target.get_required::<Settings>("app")?, applied);
+        assert_eq!(
+            target.get_required_envelope::<Settings>("app")?.payload,
+            envelope.payload
         );
         Ok(())
     }

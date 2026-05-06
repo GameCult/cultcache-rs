@@ -170,8 +170,11 @@ without pretending Rust has runtime reflection hiding under the floorboards.
 - `pull_all_backing_stores`
 - `get::<T>`
 - `get_required::<T>`
+- `get_envelope::<T>`
+- `get_required_envelope::<T>`
 - `get_all::<T>`
 - `put::<T>`
+- `put_envelope::<T>`
 - `update::<T>`
 - `delete::<T>`
 - `snapshot`
@@ -213,6 +216,16 @@ The envelope is MessagePack, and the payload inside each envelope is also raw
 MessagePack bytes encoded from the registered concrete `DatabaseEntry` type.
 That avoids the old bootstrap path where payloads were normalized through
 `serde_json::Value`.
+
+For bit-compatible neighbors, that also enables a real fast lane:
+
+- `get_envelope::<T>()` exports the canonical persisted bytes for a typed entry
+- `put_envelope::<T>()` ingests the same envelope into another cache instance
+  without re-encoding the payload first
+
+It still decodes once for validation and typed reads. We are not pretending one
+`Vec<u8>` became metaphysically zero-copy because we believed in it harder. But
+the stupid decode/re-encode loop is gone.
 
 The `DatabaseEntry` derive does not trust Rust source field order as the durable
 schema. Every persisted member must declare a stable integer slot:
