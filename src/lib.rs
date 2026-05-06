@@ -457,17 +457,21 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, DatabaseEntry)]
+    #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
     #[cultcache(type = "settings")]
     struct Settings {
+        #[cultcache(key = 0)]
         theme: String,
+        #[cultcache(key = 1, default)]
         retries: u32,
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, DatabaseEntry)]
+    #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
     #[cultcache(type = "note")]
     struct Note {
+        #[cultcache(key = 0)]
         title: String,
+        #[cultcache(key = 1)]
         body: String,
     }
 

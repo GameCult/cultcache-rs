@@ -40,12 +40,14 @@ a coordinator.
 
 ```rust
 use cultcache_rs::{CultCache, DatabaseEntry, SingleFileMessagePackBackingStore};
-use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, DatabaseEntry)]
+#[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
 #[cultcache(type = "settings")]
 struct Settings {
+    #[cultcache(key = 0)]
     theme: String,
+
+    #[cultcache(key = 1, default)]
     retries: u32,
 }
 
@@ -101,7 +103,8 @@ Rust does not have C#-style assembly scanning or runtime subclass discovery.
 The closest honest Rust translation is:
 
 - domain structs implement a marker trait, `DatabaseEntry`
-- serde/rmp-serde provides the known concrete formatter path
+- the derive macro generates a positional array formatter from explicit integer
+  field slots
 - the envelope carries the polymorphic type discriminator
 - unknown persisted type ids fail closed instead of constructing arbitrary
   runtime types
@@ -118,11 +121,16 @@ surface for a closed entry set.
 The target user-facing shape should be:
 
 ```rust
-#[derive(Clone, Serialize, Deserialize, DatabaseEntry)]
+#[derive(Clone, DatabaseEntry)]
 #[cultcache(type = "player")]
 pub struct PlayerData {
+    #[cultcache(key = 0)]
     pub id: String,
+
+    #[cultcache(key = 1)]
     pub name: String,
+
+    #[cultcache(key = 2)]
     pub faction: String,
 }
 
@@ -206,6 +214,29 @@ MessagePack bytes encoded from the registered concrete `DatabaseEntry` type.
 That avoids the old bootstrap path where payloads were normalized through
 `serde_json::Value`.
 
+The `DatabaseEntry` derive does not trust Rust source field order as the durable
+schema. Every persisted member must declare a stable integer slot:
+
+```rust
+#[derive(Clone, DatabaseEntry)]
+#[cultcache(type = "player")]
+pub struct PlayerData {
+    #[cultcache(key = 0)]
+    pub id: String,
+
+    #[cultcache(key = 1)]
+    pub name: String,
+
+    #[cultcache(key = 2, default)]
+    pub level: u32,
+}
+```
+
+The derive emits a tuple/array formatter. Gaps serialize as nil. Missing fields
+marked `default` use `Default::default()` when older payloads are read. Deleted
+field slots should stay reserved until an explicit store migration rewrites the
+data.
+
 The single-file MessagePack store rewrites an atomic snapshot. That is a sane
 starting point for small typed state surfaces, settings, Epiphany agent memory,
 heartbeat state, and other compact control-plane data. Large corpora should use
@@ -222,7 +253,8 @@ coordinator when higher-level write ordering matters.
 1. **Derive macro**
    - `#[derive(DatabaseEntry)]`
    - `#[cultcache(type = "...")]`
-   - landed for basic type/schema identity
+   - `#[cultcache(key = N)]` on every persisted field
+   - tuple/array formatter generation landed
    - optional `#[cultcache(name)]`, `#[cultcache(index)]`, and
      `#[cultcache(global)]` are still future work
 
