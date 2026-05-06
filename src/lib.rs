@@ -3,16 +3,40 @@ use anyhow::Result;
 use anyhow::anyhow;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+extern crate self as cultcache_rs;
+
+pub use cultcache_rs_derive::DatabaseEntry;
+
 pub trait DatabaseEntry: Serialize + DeserializeOwned + Clone + Send + 'static {
     const TYPE: &'static str;
     const SCHEMA_NAME: &'static str = "DatabaseEntry";
+}
+
+pub trait CultCacheRegistry {
+    fn register_entries(&self, cache: &mut CultCache) -> Result<()>;
+}
+
+#[macro_export]
+macro_rules! cultcache_registry {
+    ($name:ident { $($entry:ty),* $(,)? }) => {
+        #[derive(Clone, Copy, Debug, Default)]
+        pub struct $name;
+
+        impl $crate::CultCacheRegistry for $name {
+            fn register_entries(&self, cache: &mut $crate::CultCache) -> ::anyhow::Result<()> {
+                $(
+                    cache.register_entry_type::<$entry>()?;
+                )*
+                Ok(())
+            }
+        }
+    };
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -21,7 +45,8 @@ pub struct CultCacheEnvelope {
     pub key: String,
     #[serde(rename = "type")]
     pub r#type: String,
-    pub payload: Value,
+    #[serde(with = "serde_bytes")]
+    pub payload: Vec<u8>,
     pub stored_at: String,
 }
 
@@ -66,7 +91,7 @@ impl SingleFileMessagePackBackingStore {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let bytes = rmp_serde::to_vec_named(entries).context("failed to encode MessagePack")?;
+        let bytes = rmp_serde::to_vec(entries).context("failed to encode MessagePack")?;
         let tmp_path = temporary_path_for(&self.path);
         fs::write(&tmp_path, bytes)
             .with_context(|| format!("failed to write {}", tmp_path.display()))?;
@@ -162,6 +187,11 @@ impl CultCache {
         self.register_entry_type::<T>()
     }
 
+    pub fn register_registry<R: CultCacheRegistry>(&mut self, registry: R) -> Result<&mut Self> {
+        registry.register_entries(self)?;
+        Ok(self)
+    }
+
     pub fn add_backing_store(
         &mut self,
         store: impl CacheBackingStore + 'static,
@@ -195,11 +225,11 @@ impl CultCache {
     }
 
     pub fn get<T: DatabaseEntry>(&self, key: &str) -> Result<Option<T>> {
-        self.require_document_type::<T>()?;
+        self.require_entry_type::<T>()?;
         let Some(entry) = self.entries.get(&entry_id_parts(T::TYPE, key)) else {
             return Ok(None);
         };
-        let payload = serde_json::from_value(entry.payload.clone()).with_context(|| {
+        let payload = rmp_serde::from_slice(&entry.payload).with_context(|| {
             format!(
                 "failed to decode CultCache entry {:?} at key {:?} as {}",
                 T::TYPE,
@@ -216,38 +246,36 @@ impl CultCache {
     }
 
     pub fn get_all<T: DatabaseEntry>(&self) -> Result<Vec<T>> {
-        self.require_document_type::<T>()?;
+        self.require_entry_type::<T>()?;
         let mut values = Vec::new();
         for entry in self.entries.values() {
             if entry.r#type != T::TYPE {
                 continue;
             }
-            values.push(
-                serde_json::from_value(entry.payload.clone()).with_context(|| {
-                    format!(
-                        "failed to decode CultCache entry {:?} at key {:?} as {}",
-                        T::TYPE,
-                        entry.key,
-                        T::SCHEMA_NAME
-                    )
-                })?,
-            );
+            values.push(rmp_serde::from_slice(&entry.payload).with_context(|| {
+                format!(
+                    "failed to decode CultCache entry {:?} at key {:?} as {}",
+                    T::TYPE,
+                    entry.key,
+                    T::SCHEMA_NAME
+                )
+            })?);
         }
         Ok(values)
     }
 
     pub fn put<T: DatabaseEntry>(&mut self, key: impl Into<String>, value: &T) -> Result<T> {
-        self.require_document_type::<T>()?;
+        self.require_entry_type::<T>()?;
         let key = key.into();
-        let parsed: T = serde_json::from_value(serde_json::to_value(value).with_context(|| {
+        let payload = rmp_serde::to_vec(value).with_context(|| {
             format!(
                 "failed to encode CultCache entry {:?} at key {:?} as {}",
                 T::TYPE,
                 key,
                 T::SCHEMA_NAME
             )
-        })?)
-        .with_context(|| {
+        })?;
+        let parsed: T = rmp_serde::from_slice(&payload).with_context(|| {
             format!(
                 "failed to validate CultCache entry {:?} at key {:?} as {}",
                 T::TYPE,
@@ -258,7 +286,7 @@ impl CultCache {
         let entry = CultCacheEnvelope {
             key: key.clone(),
             r#type: T::TYPE.to_string(),
-            payload: serde_json::to_value(&parsed)?,
+            payload,
             stored_at: now_utc_second(),
         };
         let route = self.resolve_route_indices(T::TYPE);
@@ -286,7 +314,7 @@ impl CultCache {
     }
 
     pub fn delete<T: DatabaseEntry>(&mut self, key: &str) -> Result<bool> {
-        self.require_document_type::<T>()?;
+        self.require_entry_type::<T>()?;
         let id = entry_id_parts(T::TYPE, key);
         let Some(entry) = self.entries.get(&id).cloned() else {
             return Ok(false);
@@ -310,7 +338,7 @@ impl CultCache {
         self.entries.values().cloned().collect()
     }
 
-    fn require_document_type<T: DatabaseEntry>(&self) -> Result<()> {
+    fn require_entry_type<T: DatabaseEntry>(&self) -> Result<()> {
         match self.definitions.get(T::TYPE) {
             Some(schema_name) if *schema_name == T::SCHEMA_NAME => Ok(()),
             _ => Err(anyhow!(
@@ -372,25 +400,21 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, DatabaseEntry)]
+    #[cultcache(type = "settings")]
     struct Settings {
         theme: String,
         retries: u32,
     }
 
-    impl DatabaseEntry for Settings {
-        const TYPE: &'static str = "settings";
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, DatabaseEntry)]
+    #[cultcache(type = "note")]
     struct Note {
         title: String,
         body: String,
     }
 
-    impl DatabaseEntry for Note {
-        const TYPE: &'static str = "note";
-    }
+    cultcache_registry!(TestEntries { Settings, Note });
 
     #[test]
     fn familiar_cultcache_flow_persists_and_reloads_typed_documents() -> Result<()> {
@@ -421,8 +445,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let store_path = temp.path().join("cache.msgpack");
         let mut cache = CultCache::new();
-        cache.register_entry_type::<Settings>()?;
-        cache.register_entry_type::<Note>()?;
+        cache.register_registry(TestEntries)?;
         cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
 
         cache.put(
@@ -512,7 +535,7 @@ mod tests {
         store.push(&CultCacheEnvelope {
             key: "unknown".to_string(),
             r#type: "unregistered".to_string(),
-            payload: serde_json::json!({"value": 1}),
+            payload: rmp_serde::to_vec(&1_u8)?,
             stored_at: now_utc_second(),
         })?;
 
@@ -523,6 +546,53 @@ mod tests {
             error
                 .to_string()
                 .contains("No schema is registered for persisted entry type")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn payload_is_binary_messagepack_not_json_value() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("cache.msgpack");
+        let mut cache = CultCache::new();
+        cache.register_entry_type::<Settings>()?;
+        cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
+        cache.put(
+            "app",
+            &Settings {
+                theme: "ash".to_string(),
+                retries: 3,
+            },
+        )?;
+
+        let entry = cache.snapshot().remove(0);
+        let decoded: Settings = rmp_serde::from_slice(&entry.payload)?;
+        assert_eq!(decoded.theme, "ash");
+        assert!(!entry.payload.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn corrupted_payload_fails_during_typed_retrieval() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("cache.msgpack");
+        let mut store = SingleFileMessagePackBackingStore::new(&store_path);
+        store.push(&CultCacheEnvelope {
+            key: "app".to_string(),
+            r#type: "settings".to_string(),
+            payload: vec![0xc1],
+            stored_at: now_utc_second(),
+        })?;
+
+        let mut cache = CultCache::new();
+        cache.register_entry_type::<Settings>()?;
+        cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
+        cache.pull_all_backing_stores()?;
+        let error = cache.get_required::<Settings>("app").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode CultCache entry")
         );
         Ok(())
     }

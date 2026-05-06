@@ -11,9 +11,9 @@ let player = cache.get_required::<PlayerData>("player:meta")?;
 cache.put("player:meta", &player)?;
 ```
 
-The persistence layer should deal with envelopes, routing, MessagePack, and
-schema identity. Application code should not paw at loose JSON files like a sad
-little bureaucrat with a clipboard.
+The persistence layer should deal with envelopes, routing, MessagePack payload
+bytes, and schema identity. Application code should not paw at loose JSON files
+like a sad little bureaucrat with a clipboard.
 
 ## What It Is
 
@@ -23,6 +23,8 @@ CultCache is a domain cache with persistence adapters.
 - Domain structs implement `DatabaseEntry`.
 - Entries are stored behind a `type::key` identity, so multiple entry types
   can share a logical key without colliding.
+- Each payload is encoded directly from the known `DatabaseEntry` type into
+  MessagePack bytes.
 - Backing stores are adapters, not the public data model.
 - Writes persist to the resolved backing store before the in-memory cache is
   updated.
@@ -36,22 +38,14 @@ a coordinator.
 ## Current API
 
 ```rust
-use cultcache_rs::{
-    CultCache,
-    DatabaseEntry,
-    SingleFileMessagePackBackingStore,
-};
+use cultcache_rs::{CultCache, DatabaseEntry, SingleFileMessagePackBackingStore};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, DatabaseEntry)]
+#[cultcache(type = "settings")]
 struct Settings {
     theme: String,
     retries: u32,
-}
-
-impl DatabaseEntry for Settings {
-    const TYPE: &'static str = "settings";
-    const SCHEMA_NAME: &'static str = "Settings";
 }
 
 let mut cache = CultCache::new();
@@ -66,6 +60,20 @@ cache.put("app", &Settings {
 
 let settings = cache.get_required::<Settings>("app")?;
 # Ok::<(), anyhow::Error>(())
+```
+
+For a closed set of entries, generate a registry instead of repeating yourself:
+
+```rust
+use cultcache_rs::cultcache_registry;
+
+cultcache_registry!(GameCultEntries {
+    Settings,
+    PlayerData,
+});
+
+let mut cache = CultCache::new();
+cache.register_registry(GameCultEntries)?;
 ```
 
 The important part is that callers retrieve domain values directly:
@@ -92,15 +100,17 @@ Rust does not have C#-style assembly scanning or runtime subclass discovery.
 The closest honest Rust translation is:
 
 - domain structs implement a marker trait, `DatabaseEntry`
-- serde provides encode/decode
+- serde/rmp-serde provides the known concrete formatter path
 - the envelope carries the polymorphic type discriminator
 - unknown persisted type ids fail closed instead of constructing arbitrary
   runtime types
 - a generated registry should eventually replace repetitive manual
   registration
 
-Manual `register_entry_type::<T>()` is acceptable for the first crate slice,
-but it is not the final ergonomic contract. It is the scaffolding, not the house.
+Manual `register_entry_type::<T>()` is still accepted, but entry identity no
+longer needs a hand-written impl: `#[derive(DatabaseEntry)]` declares it beside
+the domain type. `cultcache_registry!` provides the current generated resolver
+surface for a closed entry set.
 
 ## Intended Rust Ergonomics
 
@@ -124,14 +134,12 @@ cache.pull_all_backing_stores()?;
 let player = cache.get_required::<PlayerData>("player:ari")?;
 ```
 
-That implies two companion pieces this crate does not have yet:
+The current `cultcache_registry!` macro is deliberately simple. The remaining
+ergonomic endpoint is automatic inventory or build-script generation so users
+do not have to maintain the registry list by hand.
 
-- `cultcache-rs-derive`: a proc-macro crate deriving `DatabaseEntry`
-- a generated entry registry, produced either by macro inventory or build
-  script, so callers do not hand-register every entry type
-
-The generated registry is the Rust equivalent of C# reflection and MessagePack
-resolver setup. It should know:
+The registry is the Rust equivalent of C# reflection and MessagePack resolver
+setup. It should know:
 
 - entry type id
 - generated MessagePack/serde formatter path
@@ -192,6 +200,11 @@ This mirrors the C# behavior:
 `put` persists before mutating the in-memory cache. If persistence fails, the
 cache does not pretend the write succeeded.
 
+The envelope is MessagePack, and the payload inside each envelope is also raw
+MessagePack bytes encoded from the registered concrete `DatabaseEntry` type.
+That avoids the old bootstrap path where payloads were normalized through
+`serde_json::Value`.
+
 The single-file MessagePack store rewrites an atomic snapshot. That is a sane
 starting point for small typed state surfaces, settings, Epiphany agent memory,
 heartbeat state, and other compact control-plane data. Large corpora should use
@@ -203,13 +216,15 @@ warehouse and then acting wounded when physics invoices us.
 1. **Derive macro**
    - `#[derive(DatabaseEntry)]`
    - `#[cultcache(type = "...")]`
+   - landed for basic type/schema identity
    - optional `#[cultcache(name)]`, `#[cultcache(index)]`, and
-     `#[cultcache(global)]`
+     `#[cultcache(global)]` are still future work
 
 2. **Generated registry**
    - a `CultCacheRegistry` trait
    - `cache.register_registry(GameCultEntries)`
-   - optional store routes declared beside the type
+   - basic macro registry landed
+   - automatic inventory/build-script generation and store routes are future work
 
 3. **Name and index lookups**
    - `cache.get_by_name::<T>("Potion")`
@@ -254,8 +269,8 @@ That is the Rust version of the original trick:
 - C# refuses to store objects outside the `DatabaseEntry` root type.
 - Runtime-visible `DatabaseEntry` subclasses get dedicated formatters.
 - Unknown or unregistered types are rejected.
-- MessagePack payloads deserialize through known concrete formatters, not an
-  open-world type loader.
+- MessagePack payload bytes deserialize through known concrete formatters, not
+  an open-world type loader or generic structured-value bridge.
 
 The derive/registry work should preserve that shape. Its job is to remove
 manual registration ceremony, not to loosen the closed-world boundary.
