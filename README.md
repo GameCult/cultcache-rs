@@ -1,25 +1,39 @@
 # CultCache Rust
 
-`cultcache-rs` is the Rust port of the useful part of GameCult's CultCache
-idea: consumer code talks to domain types in one polymorphism-aware in-memory
-cache, while backing stores handle persistence. The cache should feel like it
-never forgets. The store is how it remembers after the process dies.
+`cultcache-rs` is the Rust port of the useful part of GameCult's CultCache:
+a polymorphism-aware in-memory cache that remembers through pluggable backing
+stores.
 
-This is not an ORM, not a database, and not a tiny cathedral built because JSON
-files looked at us funny.
+Consumer code should think in domain types:
 
-## Shape
+```rust
+let player = cache.get_required::<PlayerData>("player:meta")?;
+cache.put("player:meta", &player)?;
+```
+
+The persistence layer should deal with envelopes, routing, MessagePack, and
+schema identity. Application code should not paw at loose JSON files like a sad
+little bureaucrat with a clipboard.
+
+## What It Is
+
+CultCache is a domain cache with persistence adapters.
 
 - `CultCache` is the query and mutation surface.
 - Domain structs implement `CultCacheDocument`.
-- Entries are keyed by `type::key`, so different document types can share a key.
-- Backing stores are persistence adapters.
+- Entries are stored behind a `type::key` identity, so multiple document types
+  can share a logical key without colliding.
+- Backing stores are adapters, not the public data model.
 - Writes persist to the resolved backing store before the in-memory cache is
   updated.
 - Type-specific backing stores beat generic backing stores.
 - `SingleFileMessagePackBackingStore` is the first concrete store.
 
-## Example
+This is not an ORM, not a database, and not distributed consensus in a novelty
+hat. If multiple processes write the same backing file, use an external lock or
+a coordinator.
+
+## Current API
 
 ```rust
 use cultcache_rs::{
@@ -37,6 +51,7 @@ struct Settings {
 
 impl CultCacheDocument for Settings {
     const TYPE: &'static str = "settings";
+    const SCHEMA_NAME: &'static str = "Settings";
 }
 
 let mut cache = CultCache::new();
@@ -53,13 +68,178 @@ let settings = cache.get_required::<Settings>("app")?;
 # Ok::<(), anyhow::Error>(())
 ```
 
-## Current Scope
+The important part is that callers retrieve domain values directly:
 
-- typed heterogeneous document cache
-- MessagePack single-file backing store
-- generic and type-specific store routing
-- `get`, `get_required`, `get_all`, `put`, `update`, `delete`, and `snapshot`
+```rust
+let settings: Settings = cache.get_required("app")?;
+let all_settings: Vec<Settings> = cache.get_all()?;
+```
 
-If multiple processes write the same backing file, use an external lock or a
-coordinator. The single-file store is atomic for replacement, not a distributed
-consensus machine in a fake mustache.
+The cache is the ergonomic surface. The backing store is the memory prosthetic.
+
+## How This Maps From Original CultCache
+
+The original C# CultCache relies on runtime reflection:
+
+- cacheable models inherit from `DatabaseEntry`
+- the cache scans child classes at startup
+- `Get<T>(id)` returns a `T`
+- optional `INamedEntry` enables name lookup
+- optional field/property indexes are registered by member name
+- backing stores pull/push/delete `DatabaseEntry` values
+
+Rust does not have C#-style assembly scanning or runtime subclass discovery.
+The closest honest Rust translation is:
+
+- domain structs implement a marker trait, `CultCacheDocument`
+- serde provides encode/decode
+- the envelope carries the polymorphic type discriminator
+- a generated registry should eventually replace repetitive manual
+  registration
+
+Manual `register_document_type::<T>()` is acceptable for the first crate slice,
+but it is not the final ergonomic contract. It is the scaffolding, not the house.
+
+## Intended Rust Ergonomics
+
+The target user-facing shape should be:
+
+```rust
+#[derive(Clone, Serialize, Deserialize, CultCacheDocument)]
+#[cultcache(type = "player")]
+pub struct PlayerData {
+    pub id: String,
+    pub name: String,
+    pub faction: String,
+}
+
+let mut cache = CultCache::builder()
+    .with_generated_documents(game_documents())
+    .with_generic_store(SingleFileMessagePackBackingStore::new("cache.msgpack"))
+    .build()?;
+
+cache.pull_all_backing_stores()?;
+let player = cache.get_required::<PlayerData>("player:ari")?;
+```
+
+That implies two companion pieces this crate does not have yet:
+
+- `cultcache-rs-derive`: a proc-macro crate deriving `CultCacheDocument`
+- a generated document registry, produced either by macro inventory or build
+  script, so callers do not hand-register every document type
+
+The generated registry is the Rust equivalent of C# reflection and MessagePack
+resolver setup. It should know:
+
+- document type id
+- Rust type name / schema name
+- optional store domain route
+- optional name key extractor
+- optional secondary indexes
+- optional global singleton marker
+
+In other words: code generation should restore the original CultCache feeling
+without pretending Rust has runtime reflection hiding under the floorboards.
+
+## Current Surface
+
+- `CultCache::new`
+- `register_document_type::<T>`
+- `add_generic_backing_store`
+- `add_backing_store`
+- `pull_all_backing_stores`
+- `get::<T>`
+- `get_required::<T>`
+- `get_all::<T>`
+- `put::<T>`
+- `update::<T>`
+- `delete::<T>`
+- `snapshot`
+- `SingleFileMessagePackBackingStore`
+
+## Backing Store Routing
+
+Generic store:
+
+```rust
+cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new("cache.msgpack"));
+```
+
+Type-specific store:
+
+```rust
+cache.add_backing_store(
+    SingleFileMessagePackBackingStore::new("players.msgpack"),
+    ["player"],
+);
+```
+
+When writing a `PlayerData`, the cache checks type-specific stores first. If none
+match, it writes to the first generic store. Later matching stores are mirrors.
+
+This mirrors the C# behavior:
+
+- specific domain stores own their domain
+- the first generic store is the primary generic write target
+- later generic stores mirror writes
+- this is not multi-master
+
+## Persistence Semantics
+
+`put` persists before mutating the in-memory cache. If persistence fails, the
+cache does not pretend the write succeeded.
+
+The single-file MessagePack store rewrites an atomic snapshot. That is a sane
+starting point for small typed state surfaces, settings, Epiphany agent memory,
+heartbeat state, and other compact control-plane data. Large corpora should use
+a sharded store or a real database instead of asking one file to become a
+warehouse and then acting wounded when physics invoices us.
+
+## Near-Term Ergonomic Improvements
+
+1. **Derive macro**
+   - `#[derive(CultCacheDocument)]`
+   - `#[cultcache(type = "...")]`
+   - optional `#[cultcache(name)]`, `#[cultcache(index)]`, and
+     `#[cultcache(global)]`
+
+2. **Generated registry**
+   - a `CultCacheRegistry` trait
+   - `cache.register_registry(GameCultDocuments)`
+   - optional store routes declared beside the type
+
+3. **Name and index lookups**
+   - `cache.get_by_name::<T>("Potion")`
+   - `cache.get_by_index::<T>("faction", "Lucent")`
+   - generated extractors instead of reflection strings
+
+4. **Schema/version metadata**
+   - schema version in the envelope or payload metadata
+   - explicit migration hooks
+   - refusal on unknown persisted document types unless a migration/resolver is
+     installed
+
+5. **Projection helpers**
+   - JSON projection for review and git diffs
+   - vector stripping / large-field elision for agent memory surfaces
+
+## Why Not Skip Registration Immediately?
+
+Rust can only deserialize polymorphic data into concrete types if something
+maps the persisted `type` discriminator to the Rust type. In C#, reflection and
+MessagePack resolvers can discover classes at runtime. In Rust, that map has to
+come from somewhere:
+
+- explicit registration
+- a generated registry
+- a macro inventory crate
+- a hand-written resolver
+
+Explicit registration is the simplest honest implementation. Generated registry
+is the ergonomic destination. Hand-written resolver tables are the punishment
+we give ourselves if we get lazy.
+
+## License
+
+Private GameCult infrastructure for now. Public packaging can wait until the
+API grows enough teeth to deserve strangers.
