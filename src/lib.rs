@@ -10,9 +10,9 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-pub trait CultCacheDocument: Serialize + DeserializeOwned + Clone + Send + 'static {
+pub trait DatabaseEntry: Serialize + DeserializeOwned + Clone + Send + 'static {
     const TYPE: &'static str;
-    const SCHEMA_NAME: &'static str = "CultCacheDocument";
+    const SCHEMA_NAME: &'static str = "DatabaseEntry";
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -140,10 +140,10 @@ impl CultCache {
         }
     }
 
-    pub fn register_document_type<T: CultCacheDocument>(&mut self) -> Result<()> {
+    pub fn register_entry_type<T: DatabaseEntry>(&mut self) -> Result<()> {
         if T::TYPE.trim().is_empty() {
             return Err(anyhow!(
-                "CultCache document types must declare a non-empty type"
+                "CultCache entry types must declare a non-empty type"
             ));
         }
         if let Some(existing_schema) = self.definitions.get(T::TYPE)
@@ -156,6 +156,10 @@ impl CultCache {
         }
         self.definitions.insert(T::TYPE.to_string(), T::SCHEMA_NAME);
         Ok(())
+    }
+
+    pub fn register_document_type<T: DatabaseEntry>(&mut self) -> Result<()> {
+        self.register_entry_type::<T>()
     }
 
     pub fn add_backing_store(
@@ -180,7 +184,7 @@ impl CultCache {
             for entry in registration.store.pull_all()? {
                 if !known_types.contains(&entry.r#type) {
                     return Err(anyhow!(
-                        "No schema is registered for persisted document type {:?}",
+                        "No schema is registered for persisted entry type {:?}",
                         entry.r#type
                     ));
                 }
@@ -190,14 +194,14 @@ impl CultCache {
         Ok(())
     }
 
-    pub fn get<T: CultCacheDocument>(&self, key: &str) -> Result<Option<T>> {
+    pub fn get<T: DatabaseEntry>(&self, key: &str) -> Result<Option<T>> {
         self.require_document_type::<T>()?;
         let Some(entry) = self.entries.get(&entry_id_parts(T::TYPE, key)) else {
             return Ok(None);
         };
         let payload = serde_json::from_value(entry.payload.clone()).with_context(|| {
             format!(
-                "failed to decode CultCache document {:?} at key {:?} as {}",
+                "failed to decode CultCache entry {:?} at key {:?} as {}",
                 T::TYPE,
                 key,
                 T::SCHEMA_NAME
@@ -206,12 +210,12 @@ impl CultCache {
         Ok(Some(payload))
     }
 
-    pub fn get_required<T: CultCacheDocument>(&self, key: &str) -> Result<T> {
+    pub fn get_required<T: DatabaseEntry>(&self, key: &str) -> Result<T> {
         self.get::<T>(key)?
-            .ok_or_else(|| anyhow!("CultCache has no {:?} document at key {:?}", T::TYPE, key))
+            .ok_or_else(|| anyhow!("CultCache has no {:?} entry at key {:?}", T::TYPE, key))
     }
 
-    pub fn get_all<T: CultCacheDocument>(&self) -> Result<Vec<T>> {
+    pub fn get_all<T: DatabaseEntry>(&self) -> Result<Vec<T>> {
         self.require_document_type::<T>()?;
         let mut values = Vec::new();
         for entry in self.entries.values() {
@@ -221,7 +225,7 @@ impl CultCache {
             values.push(
                 serde_json::from_value(entry.payload.clone()).with_context(|| {
                     format!(
-                        "failed to decode CultCache document {:?} at key {:?} as {}",
+                        "failed to decode CultCache entry {:?} at key {:?} as {}",
                         T::TYPE,
                         entry.key,
                         T::SCHEMA_NAME
@@ -232,12 +236,12 @@ impl CultCache {
         Ok(values)
     }
 
-    pub fn put<T: CultCacheDocument>(&mut self, key: impl Into<String>, value: &T) -> Result<T> {
+    pub fn put<T: DatabaseEntry>(&mut self, key: impl Into<String>, value: &T) -> Result<T> {
         self.require_document_type::<T>()?;
         let key = key.into();
         let parsed: T = serde_json::from_value(serde_json::to_value(value).with_context(|| {
             format!(
-                "failed to encode CultCache document {:?} at key {:?} as {}",
+                "failed to encode CultCache entry {:?} at key {:?} as {}",
                 T::TYPE,
                 key,
                 T::SCHEMA_NAME
@@ -245,7 +249,7 @@ impl CultCache {
         })?)
         .with_context(|| {
             format!(
-                "failed to validate CultCache document {:?} at key {:?} as {}",
+                "failed to validate CultCache entry {:?} at key {:?} as {}",
                 T::TYPE,
                 key,
                 T::SCHEMA_NAME
@@ -260,7 +264,7 @@ impl CultCache {
         let route = self.resolve_route_indices(T::TYPE);
         let Some(primary_index) = route.first().copied() else {
             return Err(anyhow!(
-                "No backing store is registered for document type {:?}",
+                "No backing store is registered for entry type {:?}",
                 T::TYPE
             ));
         };
@@ -274,14 +278,14 @@ impl CultCache {
 
     pub fn update<T, F>(&mut self, key: &str, updater: F) -> Result<T>
     where
-        T: CultCacheDocument,
+        T: DatabaseEntry,
         F: FnOnce(Option<T>) -> T,
     {
         let current = self.get::<T>(key)?;
         self.put::<T>(key.to_string(), &updater(current))
     }
 
-    pub fn delete<T: CultCacheDocument>(&mut self, key: &str) -> Result<bool> {
+    pub fn delete<T: DatabaseEntry>(&mut self, key: &str) -> Result<bool> {
         self.require_document_type::<T>()?;
         let id = entry_id_parts(T::TYPE, key);
         let Some(entry) = self.entries.get(&id).cloned() else {
@@ -290,7 +294,7 @@ impl CultCache {
         let route = self.resolve_route_indices(T::TYPE);
         let Some(primary_index) = route.first().copied() else {
             return Err(anyhow!(
-                "No backing store is registered for document type {:?}",
+                "No backing store is registered for entry type {:?}",
                 T::TYPE
             ));
         };
@@ -306,11 +310,11 @@ impl CultCache {
         self.entries.values().cloned().collect()
     }
 
-    fn require_document_type<T: CultCacheDocument>(&self) -> Result<()> {
+    fn require_document_type<T: DatabaseEntry>(&self) -> Result<()> {
         match self.definitions.get(T::TYPE) {
             Some(schema_name) if *schema_name == T::SCHEMA_NAME => Ok(()),
             _ => Err(anyhow!(
-                "CultCache document type {:?} is not registered on this cache instance",
+                "CultCache entry type {:?} is not registered on this cache instance",
                 T::TYPE
             )),
         }
@@ -374,7 +378,7 @@ mod tests {
         retries: u32,
     }
 
-    impl CultCacheDocument for Settings {
+    impl DatabaseEntry for Settings {
         const TYPE: &'static str = "settings";
     }
 
@@ -384,7 +388,7 @@ mod tests {
         body: String,
     }
 
-    impl CultCacheDocument for Note {
+    impl DatabaseEntry for Note {
         const TYPE: &'static str = "note";
     }
 
@@ -398,14 +402,14 @@ mod tests {
         };
 
         let mut cache = CultCache::new();
-        cache.register_document_type::<Settings>()?;
+        cache.register_entry_type::<Settings>()?;
         cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
         cache.pull_all_backing_stores()?;
         cache.put("app", &settings)?;
         assert_eq!(cache.get_required::<Settings>("app")?, settings);
 
         let mut reloaded = CultCache::new();
-        reloaded.register_document_type::<Settings>()?;
+        reloaded.register_entry_type::<Settings>()?;
         reloaded.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
         reloaded.pull_all_backing_stores()?;
         assert_eq!(reloaded.get_required::<Settings>("app")?, settings);
@@ -417,8 +421,8 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let store_path = temp.path().join("cache.msgpack");
         let mut cache = CultCache::new();
-        cache.register_document_type::<Settings>()?;
-        cache.register_document_type::<Note>()?;
+        cache.register_entry_type::<Settings>()?;
+        cache.register_entry_type::<Note>()?;
         cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
 
         cache.put(
@@ -448,8 +452,8 @@ mod tests {
         let generic_path = temp.path().join("generic.msgpack");
         let settings_path = temp.path().join("settings.msgpack");
         let mut cache = CultCache::new();
-        cache.register_document_type::<Settings>()?;
-        cache.register_document_type::<Note>()?;
+        cache.register_entry_type::<Settings>()?;
+        cache.register_entry_type::<Note>()?;
         cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&generic_path));
         cache.add_backing_store(
             SingleFileMessagePackBackingStore::new(&settings_path),
@@ -483,7 +487,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let store_path = temp.path().join("cache.msgpack");
         let mut cache = CultCache::new();
-        cache.register_document_type::<Settings>()?;
+        cache.register_entry_type::<Settings>()?;
         cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
 
         let updated = cache.update::<Settings, _>("app", |current| {
@@ -497,6 +501,29 @@ mod tests {
         assert_eq!(updated.retries, 1);
         assert!(cache.delete::<Settings>("app")?);
         assert!(cache.get::<Settings>("app")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn pull_rejects_unregistered_persisted_entry_type() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("cache.msgpack");
+        let mut store = SingleFileMessagePackBackingStore::new(&store_path);
+        store.push(&CultCacheEnvelope {
+            key: "unknown".to_string(),
+            r#type: "unregistered".to_string(),
+            payload: serde_json::json!({"value": 1}),
+            stored_at: now_utc_second(),
+        })?;
+
+        let mut cache = CultCache::new();
+        cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
+        let error = cache.pull_all_backing_stores().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("No schema is registered for persisted entry type")
+        );
         Ok(())
     }
 }

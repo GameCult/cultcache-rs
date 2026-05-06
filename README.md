@@ -20,8 +20,8 @@ little bureaucrat with a clipboard.
 CultCache is a domain cache with persistence adapters.
 
 - `CultCache` is the query and mutation surface.
-- Domain structs implement `CultCacheDocument`.
-- Entries are stored behind a `type::key` identity, so multiple document types
+- Domain structs implement `DatabaseEntry`.
+- Entries are stored behind a `type::key` identity, so multiple entry types
   can share a logical key without colliding.
 - Backing stores are adapters, not the public data model.
 - Writes persist to the resolved backing store before the in-memory cache is
@@ -38,7 +38,7 @@ a coordinator.
 ```rust
 use cultcache_rs::{
     CultCache,
-    CultCacheDocument,
+    DatabaseEntry,
     SingleFileMessagePackBackingStore,
 };
 use serde::{Deserialize, Serialize};
@@ -49,13 +49,13 @@ struct Settings {
     retries: u32,
 }
 
-impl CultCacheDocument for Settings {
+impl DatabaseEntry for Settings {
     const TYPE: &'static str = "settings";
     const SCHEMA_NAME: &'static str = "Settings";
 }
 
 let mut cache = CultCache::new();
-cache.register_document_type::<Settings>()?;
+cache.register_entry_type::<Settings>()?;
 cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new("cache.msgpack"));
 cache.pull_all_backing_stores()?;
 
@@ -91,13 +91,15 @@ The original C# CultCache relies on runtime reflection:
 Rust does not have C#-style assembly scanning or runtime subclass discovery.
 The closest honest Rust translation is:
 
-- domain structs implement a marker trait, `CultCacheDocument`
+- domain structs implement a marker trait, `DatabaseEntry`
 - serde provides encode/decode
 - the envelope carries the polymorphic type discriminator
+- unknown persisted type ids fail closed instead of constructing arbitrary
+  runtime types
 - a generated registry should eventually replace repetitive manual
   registration
 
-Manual `register_document_type::<T>()` is acceptable for the first crate slice,
+Manual `register_entry_type::<T>()` is acceptable for the first crate slice,
 but it is not the final ergonomic contract. It is the scaffolding, not the house.
 
 ## Intended Rust Ergonomics
@@ -105,7 +107,7 @@ but it is not the final ergonomic contract. It is the scaffolding, not the house
 The target user-facing shape should be:
 
 ```rust
-#[derive(Clone, Serialize, Deserialize, CultCacheDocument)]
+#[derive(Clone, Serialize, Deserialize, DatabaseEntry)]
 #[cultcache(type = "player")]
 pub struct PlayerData {
     pub id: String,
@@ -114,7 +116,7 @@ pub struct PlayerData {
 }
 
 let mut cache = CultCache::builder()
-    .with_generated_documents(game_documents())
+    .with_generated_entries(game_entries())
     .with_generic_store(SingleFileMessagePackBackingStore::new("cache.msgpack"))
     .build()?;
 
@@ -124,14 +126,15 @@ let player = cache.get_required::<PlayerData>("player:ari")?;
 
 That implies two companion pieces this crate does not have yet:
 
-- `cultcache-rs-derive`: a proc-macro crate deriving `CultCacheDocument`
-- a generated document registry, produced either by macro inventory or build
-  script, so callers do not hand-register every document type
+- `cultcache-rs-derive`: a proc-macro crate deriving `DatabaseEntry`
+- a generated entry registry, produced either by macro inventory or build
+  script, so callers do not hand-register every entry type
 
 The generated registry is the Rust equivalent of C# reflection and MessagePack
 resolver setup. It should know:
 
-- document type id
+- entry type id
+- generated MessagePack/serde formatter path
 - Rust type name / schema name
 - optional store domain route
 - optional name key extractor
@@ -144,7 +147,7 @@ without pretending Rust has runtime reflection hiding under the floorboards.
 ## Current Surface
 
 - `CultCache::new`
-- `register_document_type::<T>`
+- `register_entry_type::<T>`
 - `add_generic_backing_store`
 - `add_backing_store`
 - `pull_all_backing_stores`
@@ -198,14 +201,14 @@ warehouse and then acting wounded when physics invoices us.
 ## Near-Term Ergonomic Improvements
 
 1. **Derive macro**
-   - `#[derive(CultCacheDocument)]`
+   - `#[derive(DatabaseEntry)]`
    - `#[cultcache(type = "...")]`
    - optional `#[cultcache(name)]`, `#[cultcache(index)]`, and
      `#[cultcache(global)]`
 
 2. **Generated registry**
    - a `CultCacheRegistry` trait
-   - `cache.register_registry(GameCultDocuments)`
+   - `cache.register_registry(GameCultEntries)`
    - optional store routes declared beside the type
 
 3. **Name and index lookups**
@@ -216,7 +219,7 @@ warehouse and then acting wounded when physics invoices us.
 4. **Schema/version metadata**
    - schema version in the envelope or payload metadata
    - explicit migration hooks
-   - refusal on unknown persisted document types unless a migration/resolver is
+   - refusal on unknown persisted entry types unless a migration/resolver is
      installed
 
 5. **Projection helpers**
@@ -227,8 +230,9 @@ warehouse and then acting wounded when physics invoices us.
 
 Rust can only deserialize polymorphic data into concrete types if something
 maps the persisted `type` discriminator to the Rust type. In C#, reflection and
-MessagePack resolvers can discover classes at runtime. In Rust, that map has to
-come from somewhere:
+MessagePack resolvers can discover a closed `DatabaseEntry` inheritance tree at
+runtime and route it through known formatters. In Rust, that map has to come from
+somewhere:
 
 - explicit registration
 - a generated registry
@@ -238,6 +242,23 @@ come from somewhere:
 Explicit registration is the simplest honest implementation. Generated registry
 is the ergonomic destination. Hand-written resolver tables are the punishment
 we give ourselves if we get lazy.
+
+## Security Model
+
+CultCache should never parse arbitrary structured data into arbitrary runtime
+types. It only accepts persisted envelopes whose `type` discriminator resolves
+to a known `DatabaseEntry` type registered in the cache or generated registry.
+
+That is the Rust version of the original trick:
+
+- C# refuses to store objects outside the `DatabaseEntry` root type.
+- Runtime-visible `DatabaseEntry` subclasses get dedicated formatters.
+- Unknown or unregistered types are rejected.
+- MessagePack payloads deserialize through known concrete formatters, not an
+  open-world type loader.
+
+The derive/registry work should preserve that shape. Its job is to remove
+manual registration ceremony, not to loosen the closed-world boundary.
 
 ## License
 
