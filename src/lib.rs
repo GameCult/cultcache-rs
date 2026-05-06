@@ -6,6 +6,8 @@ use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -86,7 +88,20 @@ impl SingleFileMessagePackBackingStore {
         &self.path
     }
 
-    fn write_all(&self, entries: &[CultCacheEnvelope]) -> Result<()> {
+    fn read_all_unlocked(&self) -> Result<Vec<CultCacheEnvelope>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let bytes = fs::read(&self.path)
+            .with_context(|| format!("failed to read {}", self.path.display()))?;
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        rmp_serde::from_slice(&bytes)
+            .with_context(|| format!("failed to decode MessagePack {}", self.path.display()))
+    }
+
+    fn write_all_unlocked(&self, entries: &[CultCacheEnvelope]) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -108,40 +123,82 @@ impl SingleFileMessagePackBackingStore {
         })?;
         Ok(())
     }
+
+    fn with_shared_lock<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        let lock = self.open_lock_file()?;
+        fs2::FileExt::lock_shared(&lock)
+            .with_context(|| format!("failed to lock {}", self.lock_path().display()))?;
+        let result = action();
+        fs2::FileExt::unlock(&lock)
+            .with_context(|| format!("failed to unlock {}", self.lock_path().display()))?;
+        result
+    }
+
+    fn with_exclusive_lock<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        let lock = self.open_lock_file()?;
+        fs2::FileExt::lock_exclusive(&lock)
+            .with_context(|| format!("failed to lock {}", self.lock_path().display()))?;
+        let result = action();
+        fs2::FileExt::unlock(&lock)
+            .with_context(|| format!("failed to unlock {}", self.lock_path().display()))?;
+        result
+    }
+
+    fn open_lock_file(&self) -> Result<File> {
+        let lock_path = self.lock_path();
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        OpenOptions::new()
+            .create(true)
+            .read(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open {}", lock_path.display()))
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        let mut lock_name = self
+            .path
+            .file_name()
+            .map(|value| value.to_os_string())
+            .unwrap_or_else(|| "cultcache.msgpack".into());
+        lock_name.push(".lock");
+        self.path.with_file_name(lock_name)
+    }
 }
 
 impl CacheBackingStore for SingleFileMessagePackBackingStore {
     fn pull_all(&self) -> Result<Vec<CultCacheEnvelope>> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-        let bytes = fs::read(&self.path)
-            .with_context(|| format!("failed to read {}", self.path.display()))?;
-        if bytes.is_empty() {
-            return Ok(Vec::new());
-        }
-        rmp_serde::from_slice(&bytes)
-            .with_context(|| format!("failed to decode MessagePack {}", self.path.display()))
+        self.with_shared_lock(|| self.read_all_unlocked())
     }
 
     fn push(&mut self, entry: &CultCacheEnvelope) -> Result<()> {
-        let mut entries = self.pull_all()?;
-        entries.retain(|candidate| entry_id(candidate) != entry_id(entry));
-        entries.push(entry.clone());
-        entries.sort_by_key(entry_id);
-        self.write_all(&entries)
+        self.with_exclusive_lock(|| {
+            let mut entries = self.read_all_unlocked()?;
+            entries.retain(|candidate| entry_id(candidate) != entry_id(entry));
+            entries.push(entry.clone());
+            entries.sort_by_key(entry_id);
+            self.write_all_unlocked(&entries)
+        })
     }
 
     fn delete(&mut self, entry: &CultCacheEnvelope) -> Result<()> {
-        let mut entries = self.pull_all()?;
-        entries.retain(|candidate| entry_id(candidate) != entry_id(entry));
-        self.write_all(&entries)
+        self.with_exclusive_lock(|| {
+            let mut entries = self.read_all_unlocked()?;
+            entries.retain(|candidate| entry_id(candidate) != entry_id(entry));
+            self.write_all_unlocked(&entries)
+        })
     }
 
     fn push_all(&mut self, entries: &[CultCacheEnvelope], _options: PushAllOptions) -> Result<()> {
-        let mut entries = entries.to_vec();
-        entries.sort_by_key(entry_id);
-        self.write_all(&entries)
+        self.with_exclusive_lock(|| {
+            let mut entries = entries.to_vec();
+            entries.sort_by_key(entry_id);
+            self.write_all_unlocked(&entries)
+        })
     }
 }
 

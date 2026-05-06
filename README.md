@@ -29,7 +29,8 @@ CultCache is a domain cache with persistence adapters.
 - Writes persist to the resolved backing store before the in-memory cache is
   updated.
 - Type-specific backing stores beat generic backing stores.
-- `SingleFileMessagePackBackingStore` is the first concrete store.
+- `SingleFileMessagePackBackingStore` is the first concrete store and guards
+  file access with a sidecar lock file.
 
 This is not an ORM, not a database, and not distributed consensus in a novelty
 hat. If multiple processes write the same backing file, use an external lock or
@@ -210,6 +211,11 @@ starting point for small typed state surfaces, settings, Epiphany agent memory,
 heartbeat state, and other compact control-plane data. Large corpora should use
 a sharded store or a real database instead of asking one file to become a
 warehouse and then acting wounded when physics invoices us.
+
+The single-file store uses a sidecar lock file for shared reads and exclusive
+writes. That protects ordinary multi-process access to the same file. It is
+still not a multi-master replication protocol, and it is not a substitute for a
+coordinator when higher-level write ordering matters.
 
 ## Near-Term Ergonomic Improvements
 
