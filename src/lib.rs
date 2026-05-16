@@ -50,7 +50,47 @@ pub struct CultCacheEnvelope {
     #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
     pub stored_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_id: Option<String>,
 }
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedStoreSnapshot(
+    String,
+    Vec<PersistedSchemaCatalogEntry>,
+    Vec<PersistedRecord>,
+);
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedSchemaCatalogEntry(
+    String,
+    String,
+    String,
+    String,
+    String,
+    Vec<String>,
+    Vec<PersistedSchemaCatalogMember>,
+);
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedSchemaCatalogMember(
+    u32,
+    String,
+    String,
+    bool,
+    bool,
+    Option<String>,
+    bool,
+    Option<String>,
+);
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedRecord(
+    String,
+    String,
+    String,
+    #[serde(with = "serde_bytes")] Vec<u8>,
+);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PushAllOptions {
@@ -97,8 +137,10 @@ impl SingleFileMessagePackBackingStore {
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
-        rmp_serde::from_slice(&bytes)
-            .with_context(|| format!("failed to decode MessagePack {}", self.path.display()))
+        decode_store_snapshot(&bytes).or_else(|_| {
+            rmp_serde::from_slice(&bytes)
+                .with_context(|| format!("failed to decode MessagePack {}", self.path.display()))
+        })
     }
 
     fn write_all_unlocked(&self, entries: &[CultCacheEnvelope]) -> Result<()> {
@@ -106,7 +148,8 @@ impl SingleFileMessagePackBackingStore {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let bytes = rmp_serde::to_vec(entries).context("failed to encode MessagePack")?;
+        let bytes = rmp_serde::to_vec(&encode_store_snapshot(entries))
+            .context("failed to encode MessagePack")?;
         let tmp_path = temporary_path_for(&self.path);
         fs::write(&tmp_path, bytes)
             .with_context(|| format!("failed to write {}", tmp_path.display()))?;
@@ -355,6 +398,7 @@ impl CultCache {
             r#type: T::TYPE.to_string(),
             payload,
             stored_at: now_utc_second(),
+            schema_id: Some(T::TYPE.to_string()),
         };
         let route = self.resolve_route_indices(T::TYPE);
         let Some(primary_index) = route.first().copied() else {
@@ -496,6 +540,91 @@ fn entry_id_parts(r#type: &str, key: &str) -> String {
 
 fn now_utc_second() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn encode_store_snapshot(entries: &[CultCacheEnvelope]) -> PersistedStoreSnapshot {
+    let mut schema_names = BTreeSet::<String>::new();
+    for entry in entries {
+        schema_names.insert(
+            entry
+                .schema_id
+                .clone()
+                .unwrap_or_else(|| entry.r#type.clone()),
+        );
+    }
+
+    let catalog = schema_names
+        .into_iter()
+        .map(|schema_id| {
+            PersistedSchemaCatalogEntry(
+                schema_id.clone(),
+                schema_id.clone(),
+                format!("{schema_id}.v1"),
+                schema_id.clone(),
+                format!(
+                    "{{\"schemaName\":\"{}\",\"schemaVersion\":\"{}.v1\",\"members\":[]}}",
+                    escape_json_string(&schema_id),
+                    escape_json_string(&schema_id)
+                ),
+                vec![schema_id],
+                Vec::new(),
+            )
+        })
+        .collect();
+    let records = entries
+        .iter()
+        .map(|entry| {
+            PersistedRecord(
+                entry.key.clone(),
+                entry
+                    .schema_id
+                    .clone()
+                    .unwrap_or_else(|| entry.r#type.clone()),
+                entry.stored_at.clone(),
+                entry.payload.clone(),
+            )
+        })
+        .collect();
+
+    PersistedStoreSnapshot("cultcache.store.v1".to_string(), catalog, records)
+}
+
+fn decode_store_snapshot(bytes: &[u8]) -> Result<Vec<CultCacheEnvelope>> {
+    let snapshot: PersistedStoreSnapshot =
+        rmp_serde::from_slice(bytes).context("failed to decode CultCache v1 snapshot")?;
+    if snapshot.0 != "cultcache.store.v1" {
+        return Err(anyhow!("unsupported CultCache snapshot {}", snapshot.0));
+    }
+
+    let catalog = snapshot
+        .1
+        .into_iter()
+        .map(|entry| (entry.0, entry.1))
+        .collect::<BTreeMap<_, _>>();
+    snapshot
+        .2
+        .into_iter()
+        .map(|record| {
+            let r#type = catalog.get(&record.1).cloned().ok_or_else(|| {
+                anyhow!(
+                    "CultCache record {:?} references missing schema {:?}",
+                    record.0,
+                    record.1
+                )
+            })?;
+            Ok(CultCacheEnvelope {
+                key: record.0,
+                r#type,
+                stored_at: record.2,
+                payload: record.3,
+                schema_id: Some(record.1),
+            })
+        })
+        .collect()
+}
+
+fn escape_json_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn temporary_path_for(path: &Path) -> PathBuf {
@@ -653,6 +782,7 @@ mod tests {
             r#type: "unregistered".to_string(),
             payload: rmp_serde::to_vec(&1_u8)?,
             stored_at: now_utc_second(),
+            schema_id: Some("unregistered".to_string()),
         })?;
 
         let mut cache = CultCache::new();
@@ -698,6 +828,7 @@ mod tests {
             r#type: "settings".to_string(),
             payload: vec![0xc1],
             stored_at: now_utc_second(),
+            schema_id: Some("settings".to_string()),
         })?;
 
         let mut cache = CultCache::new();
