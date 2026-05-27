@@ -137,10 +137,9 @@ impl SingleFileMessagePackBackingStore {
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
-        decode_store_snapshot(&bytes).or_else(|_| {
-            rmp_serde::from_slice(&bytes)
-                .with_context(|| format!("failed to decode MessagePack {}", self.path.display()))
-        })
+        decode_store_snapshot(&bytes)
+            .or_else(|_| rmp_serde::from_slice(&bytes))
+            .with_context(|| format!("failed to decode MessagePack {}", self.path.display()))
     }
 
     fn write_all_unlocked(&self, entries: &[CultCacheEnvelope]) -> Result<()> {
