@@ -53,7 +53,7 @@ struct Settings {
 
 let mut cache = CultCache::new();
 cache.register_entry_type::<Settings>()?;
-cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new("cache.msgpack"));
+cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new("cache.cc"));
 cache.pull_all_backing_stores()?;
 
 cache.put("app", &Settings {
@@ -136,7 +136,7 @@ pub struct PlayerData {
 
 let mut cache = CultCache::builder()
     .with_generated_entries(game_entries())
-    .with_generic_store(SingleFileMessagePackBackingStore::new("cache.msgpack"))
+    .with_generic_store(SingleFileMessagePackBackingStore::new("cache.cc"))
     .build()?;
 
 cache.pull_all_backing_stores()?;
@@ -185,14 +185,14 @@ without pretending Rust has runtime reflection hiding under the floorboards.
 Generic store:
 
 ```rust
-cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new("cache.msgpack"));
+cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new("cache.cc"));
 ```
 
 Type-specific store:
 
 ```rust
 cache.add_backing_store(
-    SingleFileMessagePackBackingStore::new("players.msgpack"),
+    SingleFileMessagePackBackingStore::new("players.cc"),
     ["player"],
 );
 ```

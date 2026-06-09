@@ -206,7 +206,7 @@ impl SingleFileMessagePackBackingStore {
             .path
             .file_name()
             .map(|value| value.to_os_string())
-            .unwrap_or_else(|| "cultcache.msgpack".into());
+            .unwrap_or_else(|| "cultcache.cc".into());
         lock_name.push(".lock");
         self.path.with_file_name(lock_name)
     }
@@ -630,7 +630,7 @@ fn temporary_path_for(path: &Path) -> PathBuf {
     let mut file_name = path
         .file_name()
         .map(|value| value.to_os_string())
-        .unwrap_or_else(|| "cultcache.msgpack".into());
+        .unwrap_or_else(|| "cultcache.cc".into());
     file_name.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
     path.with_file_name(file_name)
 }
@@ -663,7 +663,7 @@ mod tests {
     #[test]
     fn familiar_cultcache_flow_persists_and_reloads_typed_documents() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let store_path = temp.path().join("cache.msgpack");
+        let store_path = temp.path().join("cache.cc");
         let settings = Settings {
             theme: "ash".to_string(),
             retries: 3,
@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn entry_identity_is_polymorphic_by_type_and_key() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let store_path = temp.path().join("cache.msgpack");
+        let store_path = temp.path().join("cache.cc");
         let mut cache = CultCache::new();
         cache.register_registry(TestEntries)?;
         cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
@@ -716,8 +716,8 @@ mod tests {
     #[test]
     fn type_specific_store_routes_before_generic_store() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let generic_path = temp.path().join("generic.msgpack");
-        let settings_path = temp.path().join("settings.msgpack");
+        let generic_path = temp.path().join("generic.cc");
+        let settings_path = temp.path().join("settings.cc");
         let mut cache = CultCache::new();
         cache.register_entry_type::<Settings>()?;
         cache.register_entry_type::<Note>()?;
@@ -752,7 +752,7 @@ mod tests {
     #[test]
     fn update_and_delete_follow_the_cache_api() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let store_path = temp.path().join("cache.msgpack");
+        let store_path = temp.path().join("cache.cc");
         let mut cache = CultCache::new();
         cache.register_entry_type::<Settings>()?;
         cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
@@ -774,7 +774,7 @@ mod tests {
     #[test]
     fn pull_rejects_unregistered_persisted_entry_type() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let store_path = temp.path().join("cache.msgpack");
+        let store_path = temp.path().join("cache.cc");
         let mut store = SingleFileMessagePackBackingStore::new(&store_path);
         store.push(&CultCacheEnvelope {
             key: "unknown".to_string(),
@@ -798,7 +798,7 @@ mod tests {
     #[test]
     fn payload_is_binary_messagepack_not_json_value() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let store_path = temp.path().join("cache.msgpack");
+        let store_path = temp.path().join("cache.cc");
         let mut cache = CultCache::new();
         cache.register_entry_type::<Settings>()?;
         cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
@@ -820,7 +820,7 @@ mod tests {
     #[test]
     fn corrupted_payload_fails_during_typed_retrieval() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let store_path = temp.path().join("cache.msgpack");
+        let store_path = temp.path().join("cache.cc");
         let mut store = SingleFileMessagePackBackingStore::new(&store_path);
         store.push(&CultCacheEnvelope {
             key: "app".to_string(),
@@ -846,8 +846,8 @@ mod tests {
     #[test]
     fn put_envelope_reuses_existing_messagepack_payload() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let origin_store = temp.path().join("origin.msgpack");
-        let target_store = temp.path().join("target.msgpack");
+        let origin_store = temp.path().join("origin.cc");
+        let target_store = temp.path().join("target.cc");
 
         let mut origin = CultCache::new();
         origin.register_entry_type::<Settings>()?;
