@@ -173,12 +173,45 @@ without pretending Rust has runtime reflection hiding under the floorboards.
 - `get_envelope::<T>`
 - `get_required_envelope::<T>`
 - `get_all::<T>`
+- `get_all_with_keys::<T>`
+- `soa::<T>`
 - `put::<T>`
 - `put_envelope::<T>`
 - `update::<T>`
 - `delete::<T>`
 - `snapshot`
+- `snapshot_soa`
+- `load_soa`
 - `SingleFileMessagePackBackingStore`
+
+## Structure Of Arrays
+
+The C# CultCache hot path exposes CPU-local SoA scans as:
+
+```csharp
+Span<float> x = cache.Soa<PlayerTransform>()
+    .Column<float>(nameof(PlayerTransform.PositionX))
+    .Span;
+```
+
+Rust cannot discover those columns through runtime reflection, so each domain
+type declares its column extractors explicitly with `SoaDocument` or the
+`cultcache_soa!` helper:
+
+```rust
+cultcache_soa!(PlayerTransform {
+    "position_x" => |row: &PlayerTransform| row.position_x,
+    "health" => |row: &PlayerTransform| row.health,
+});
+
+let table = cache.soa::<PlayerTransform>()?;
+let health = table.column::<i32>("health")?;
+```
+
+This is the same public shape as the C# rite: callers ask the cache for a typed
+table, then pull contiguous typed columns by name. The Rust version is explicit
+about the extractor table because the closed-world schema boundary is a virtue,
+not a missing reflection party trick.
 
 ## Backing Store Routing
 

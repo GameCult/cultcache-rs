@@ -3,11 +3,13 @@ use anyhow::Result;
 use anyhow::anyhow;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::marker::PhantomData;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -22,6 +24,83 @@ pub trait DatabaseEntry: Serialize + DeserializeOwned + Clone + Send + 'static {
 
 pub trait CultCacheRegistry {
     fn register_entries(&self, cache: &mut CultCache) -> Result<()>;
+}
+
+pub trait SoaDocument: DatabaseEntry {
+    fn soa_columns(rows: &[Self]) -> BTreeMap<&'static str, CultSoaColumnValues>;
+}
+
+pub struct CultSoaColumnValues {
+    type_name: &'static str,
+    values: Box<dyn Any + Send>,
+}
+
+impl CultSoaColumnValues {
+    pub fn new<TValue: Clone + Send + 'static>(values: Vec<TValue>) -> Self {
+        Self {
+            type_name: std::any::type_name::<TValue>(),
+            values: Box::new(values),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CultSoaColumn<TValue> {
+    name: String,
+    values: Vec<TValue>,
+}
+
+impl<TValue> CultSoaColumn<TValue> {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn values(&self) -> &[TValue] {
+        &self.values
+    }
+}
+
+pub struct CultSoaTable<TDocument> {
+    keys: Vec<String>,
+    documents: Vec<TDocument>,
+    columns: BTreeMap<String, CultSoaColumnValues>,
+    _document: PhantomData<TDocument>,
+}
+
+impl<TDocument> CultSoaTable<TDocument> {
+    pub fn keys(&self) -> &[String] {
+        &self.keys
+    }
+
+    pub fn documents(&self) -> &[TDocument] {
+        &self.documents
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    pub fn column<TValue: Clone + 'static>(&self, name: &str) -> Result<CultSoaColumn<TValue>> {
+        let Some(column) = self.columns.get(name) else {
+            return Err(anyhow!("SoA table has no column {name:?}"));
+        };
+        let Some(values) = column.values.downcast_ref::<Vec<TValue>>() else {
+            return Err(anyhow!(
+                "SoA table column {:?} stores {}, not {}",
+                name,
+                column.type_name,
+                std::any::type_name::<TValue>()
+            ));
+        };
+        Ok(CultSoaColumn {
+            name: name.to_string(),
+            values: values.clone(),
+        })
+    }
 }
 
 #[macro_export]
@@ -41,6 +120,22 @@ macro_rules! cultcache_registry {
     };
 }
 
+#[macro_export]
+macro_rules! cultcache_soa {
+    ($entry:ty { $($column:literal => $extractor:expr),* $(,)? }) => {
+        impl $crate::SoaDocument for $entry {
+            fn soa_columns(rows: &[Self]) -> ::std::collections::BTreeMap<&'static str, $crate::CultSoaColumnValues> {
+                let mut columns = ::std::collections::BTreeMap::new();
+                $(
+                    let values = rows.iter().map($extractor).collect::<Vec<_>>();
+                    columns.insert($column, $crate::CultSoaColumnValues::new(values));
+                )*
+                columns
+            }
+        }
+    };
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CultCacheEnvelope {
@@ -52,6 +147,93 @@ pub struct CultCacheEnvelope {
     pub stored_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CultCacheSoaTable {
+    pub keys: Vec<String>,
+    pub types: Vec<String>,
+    pub payloads: Vec<Vec<u8>>,
+    pub stored_ats: Vec<String>,
+    pub schema_ids: Vec<Option<String>>,
+}
+
+impl CultCacheSoaTable {
+    pub fn from_envelopes(entries: impl IntoIterator<Item = CultCacheEnvelope>) -> Self {
+        let mut table = Self::default();
+        for entry in entries {
+            table.keys.push(entry.key);
+            table.types.push(entry.r#type);
+            table.payloads.push(entry.payload);
+            table.stored_ats.push(entry.stored_at);
+            table.schema_ids.push(entry.schema_id);
+        }
+        table
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let len = self.keys.len();
+        for (name, candidate) in [
+            ("types", self.types.len()),
+            ("payloads", self.payloads.len()),
+            ("storedAts", self.stored_ats.len()),
+            ("schemaIds", self.schema_ids.len()),
+        ] {
+            if candidate != len {
+                return Err(anyhow!(
+                    "CultCache SoA column {name} has length {candidate}, expected {len}"
+                ));
+            }
+        }
+        for (index, key) in self.keys.iter().enumerate() {
+            if key.trim().is_empty() {
+                return Err(anyhow!("CultCache SoA row {index} has an empty key"));
+            }
+            if self.types[index].trim().is_empty() {
+                return Err(anyhow!("CultCache SoA row {index} has an empty type"));
+            }
+            if self.stored_ats[index].trim().is_empty() {
+                return Err(anyhow!("CultCache SoA row {index} has an empty stored_at"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn into_envelopes(self) -> Result<Vec<CultCacheEnvelope>> {
+        self.validate()?;
+        let Self {
+            keys,
+            types,
+            payloads,
+            stored_ats,
+            schema_ids,
+        } = self;
+        Ok(keys
+            .into_iter()
+            .zip(types)
+            .zip(payloads)
+            .zip(stored_ats)
+            .zip(schema_ids)
+            .map(
+                |((((key, r#type), payload), stored_at), schema_id)| CultCacheEnvelope {
+                    key,
+                    r#type,
+                    payload,
+                    stored_at,
+                    schema_id,
+                },
+            )
+            .collect())
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -373,6 +555,43 @@ impl CultCache {
         Ok(values)
     }
 
+    pub fn get_all_with_keys<T: DatabaseEntry>(&self) -> Result<Vec<(String, T)>> {
+        self.require_entry_type::<T>()?;
+        let mut values = Vec::new();
+        for entry in self.entries.values() {
+            if entry.r#type != T::TYPE {
+                continue;
+            }
+            values.push((
+                entry.key.clone(),
+                rmp_serde::from_slice(&entry.payload).with_context(|| {
+                    format!(
+                        "failed to decode CultCache entry {:?} at key {:?} as {}",
+                        T::TYPE,
+                        entry.key,
+                        T::SCHEMA_NAME
+                    )
+                })?,
+            ));
+        }
+        Ok(values)
+    }
+
+    pub fn soa<T: SoaDocument>(&self) -> Result<CultSoaTable<T>> {
+        let keyed_rows = self.get_all_with_keys::<T>()?;
+        let (keys, documents): (Vec<_>, Vec<_>) = keyed_rows.into_iter().unzip();
+        let columns = T::soa_columns(&documents)
+            .into_iter()
+            .map(|(name, values)| (name.to_string(), values))
+            .collect();
+        Ok(CultSoaTable {
+            keys,
+            documents,
+            columns,
+            _document: PhantomData,
+        })
+    }
+
     pub fn put<T: DatabaseEntry>(&mut self, key: impl Into<String>, value: &T) -> Result<T> {
         self.require_entry_type::<T>()?;
         let key = key.into();
@@ -491,6 +710,25 @@ impl CultCache {
 
     pub fn snapshot(&self) -> Vec<CultCacheEnvelope> {
         self.entries.values().cloned().collect()
+    }
+
+    pub fn snapshot_soa(&self) -> CultCacheSoaTable {
+        CultCacheSoaTable::from_envelopes(self.snapshot())
+    }
+
+    pub fn load_soa(&mut self, table: CultCacheSoaTable) -> Result<()> {
+        let known_types: BTreeSet<String> = self.definitions.keys().cloned().collect();
+        self.entries.clear();
+        for entry in table.into_envelopes()? {
+            if !known_types.contains(&entry.r#type) {
+                return Err(anyhow!(
+                    "No schema is registered for SoA entry type {:?}",
+                    entry.r#type
+                ));
+            }
+            self.entries.insert(entry_id(&entry), entry);
+        }
+        Ok(())
     }
 
     fn require_entry_type<T: DatabaseEntry>(&self) -> Result<()> {
@@ -657,6 +895,11 @@ mod tests {
         #[cultcache(key = 1)]
         body: String,
     }
+
+    cultcache_soa!(Settings {
+        "theme" => |row: &Settings| row.theme.clone(),
+        "retries" => |row: &Settings| row.retries,
+    });
 
     cultcache_registry!(TestEntries { Settings, Note });
 
@@ -880,5 +1123,93 @@ mod tests {
             envelope.payload
         );
         Ok(())
+    }
+
+    #[test]
+    fn soa_snapshot_round_trips_registered_entries() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("cache.cc");
+        let mut cache = CultCache::new();
+        cache.register_registry(TestEntries)?;
+        cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
+        cache.put(
+            "app",
+            &Settings {
+                theme: "ash".to_string(),
+                retries: 3,
+            },
+        )?;
+        cache.put(
+            "memo",
+            &Note {
+                title: "machine".to_string(),
+                body: "awake".to_string(),
+            },
+        )?;
+
+        let soa = cache.snapshot_soa();
+        assert_eq!(soa.len(), 2);
+        assert_eq!(soa.keys.len(), soa.payloads.len());
+
+        let mut restored = CultCache::new();
+        restored.register_registry(TestEntries)?;
+        restored.add_generic_backing_store(SingleFileMessagePackBackingStore::new(
+            temp.path().join("restored.cc"),
+        ));
+        restored.load_soa(soa)?;
+        assert_eq!(restored.get_required::<Settings>("app")?.theme, "ash");
+        assert_eq!(restored.get_required::<Note>("memo")?.body, "awake");
+        Ok(())
+    }
+
+    #[test]
+    fn typed_soa_columns_match_csharp_cache_ergonomics() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("cache.cc");
+        let mut cache = CultCache::new();
+        cache.register_registry(TestEntries)?;
+        cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
+        cache.put(
+            "settings:a",
+            &Settings {
+                theme: "ash".to_string(),
+                retries: 3,
+            },
+        )?;
+        cache.put(
+            "settings:b",
+            &Settings {
+                theme: "bone".to_string(),
+                retries: 5,
+            },
+        )?;
+
+        let table = cache.soa::<Settings>()?;
+        assert_eq!(
+            table.keys(),
+            &["settings:a".to_string(), "settings:b".to_string()]
+        );
+        assert_eq!(
+            table.column::<String>("theme")?.values(),
+            &["ash".to_string(), "bone".to_string()]
+        );
+        assert_eq!(table.column::<u32>("retries")?.values(), &[3, 5]);
+
+        let error = table.column::<String>("retries").unwrap_err();
+        assert!(error.to_string().contains("not alloc::string::String"));
+        Ok(())
+    }
+
+    #[test]
+    fn soa_rejects_column_length_drift() {
+        let table = CultCacheSoaTable {
+            keys: vec!["app".to_string()],
+            types: Vec::new(),
+            payloads: Vec::new(),
+            stored_ats: Vec::new(),
+            schema_ids: Vec::new(),
+        };
+        let error = table.validate().unwrap_err();
+        assert!(error.to_string().contains("column types has length 0"));
     }
 }
