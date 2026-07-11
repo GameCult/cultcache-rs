@@ -927,6 +927,35 @@ fn temporary_path_for(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct RefusingBatchStore {
+        inner: SingleFileMessagePackBackingStore,
+        refuse_batch: Arc<AtomicBool>,
+    }
+
+    impl CacheBackingStore for RefusingBatchStore {
+        fn pull_all(&self) -> Result<Vec<CultCacheEnvelope>> {
+            self.inner.pull_all()
+        }
+        fn push(&mut self, entry: &CultCacheEnvelope) -> Result<()> {
+            self.inner.push(entry)
+        }
+        fn delete(&mut self, entry: &CultCacheEnvelope) -> Result<()> {
+            self.inner.delete(entry)
+        }
+        fn push_all(
+            &mut self,
+            entries: &[CultCacheEnvelope],
+            options: PushAllOptions,
+        ) -> Result<()> {
+            if self.refuse_batch.load(Ordering::SeqCst) {
+                return Err(anyhow!("injected batch refusal"));
+            }
+            self.inner.push_all(entries, options)
+        }
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
     #[cultcache(type = "settings")]
@@ -1036,6 +1065,44 @@ mod tests {
         reloaded.pull_all_backing_stores()?;
         assert_eq!(reloaded.get_required::<Settings>("app")?.theme, "iron");
         assert_eq!(reloaded.get_required::<Note>("receipt")?.title, "committed");
+        Ok(())
+    }
+
+    #[test]
+    fn refused_batch_preserves_prior_snapshot() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("refused-batch.cc");
+        let refusal = Arc::new(AtomicBool::new(false));
+        let mut cache = CultCache::new();
+        cache.register_registry(TestEntries)?;
+        cache.add_generic_backing_store(RefusingBatchStore {
+            inner: SingleFileMessagePackBackingStore::new(&store_path),
+            refuse_batch: refusal.clone(),
+        });
+        cache.put(
+            "app",
+            &Settings {
+                theme: "before".to_string(),
+                retries: 1,
+            },
+        )?;
+        let (note, _) = cache.prepare_entry(
+            "receipt",
+            &Note {
+                title: "after".to_string(),
+                body: "must not land".to_string(),
+            },
+        )?;
+        refusal.store(true, Ordering::SeqCst);
+        assert!(cache.put_prepared_batch(vec![note]).is_err());
+        assert!(cache.get::<Note>("receipt")?.is_none());
+
+        let mut reloaded = CultCache::new();
+        reloaded.register_registry(TestEntries)?;
+        reloaded.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
+        reloaded.pull_all_backing_stores()?;
+        assert_eq!(reloaded.get_required::<Settings>("app")?.theme, "before");
+        assert!(reloaded.get::<Note>("receipt")?.is_none());
         Ok(())
     }
 
