@@ -593,6 +593,27 @@ impl CultCache {
     }
 
     pub fn put<T: DatabaseEntry>(&mut self, key: impl Into<String>, value: &T) -> Result<T> {
+        let (entry, parsed) = self.prepare_entry(key, value)?;
+        let route = self.resolve_route_indices(T::TYPE);
+        let Some(primary_index) = route.first().copied() else {
+            return Err(anyhow!(
+                "No backing store is registered for entry type {:?}",
+                T::TYPE
+            ));
+        };
+        self.stores[primary_index].store.push(&entry)?;
+        for mirror_index in route.iter().skip(1).copied() {
+            self.stores[mirror_index].store.push(&entry)?;
+        }
+        self.entries.insert(entry_id(&entry), entry);
+        Ok(parsed)
+    }
+
+    pub fn prepare_entry<T: DatabaseEntry>(
+        &self,
+        key: impl Into<String>,
+        value: &T,
+    ) -> Result<(CultCacheEnvelope, T)> {
         self.require_entry_type::<T>()?;
         let key = key.into();
         let payload = rmp_serde::to_vec(value).with_context(|| {
@@ -618,19 +639,48 @@ impl CultCache {
             stored_at: now_utc_second(),
             schema_id: Some(T::TYPE.to_string()),
         };
-        let route = self.resolve_route_indices(T::TYPE);
-        let Some(primary_index) = route.first().copied() else {
-            return Err(anyhow!(
-                "No backing store is registered for entry type {:?}",
-                T::TYPE
-            ));
-        };
-        self.stores[primary_index].store.push(&entry)?;
-        for mirror_index in route.iter().skip(1).copied() {
-            self.stores[mirror_index].store.push(&entry)?;
+        Ok((entry, parsed))
+    }
+
+    pub fn put_prepared_batch(&mut self, staged: Vec<CultCacheEnvelope>) -> Result<()> {
+        if staged.is_empty() {
+            return Err(anyhow!("CultCache batch must contain at least one entry"));
         }
-        self.entries.insert(entry_id(&entry), entry);
-        Ok(parsed)
+        let mut store_index = None;
+        for entry in staged.iter().chain(self.entries.values()) {
+            if !self.definitions.contains_key(&entry.r#type) {
+                return Err(anyhow!(
+                    "CultCache batch entry type {:?} is not registered",
+                    entry.r#type
+                ));
+            }
+            let route = self.resolve_route_indices(&entry.r#type);
+            if route.len() != 1 {
+                return Err(anyhow!(
+                    "CultCache atomic batch requires exactly one backing-store route for type {:?}, found {}",
+                    entry.r#type,
+                    route.len()
+                ));
+            }
+            match store_index {
+                Some(expected) if expected != route[0] => {
+                    return Err(anyhow!("CultCache atomic batch cannot span backing stores"));
+                }
+                None => store_index = Some(route[0]),
+                _ => {}
+            }
+        }
+        let store_index = store_index.expect("non-empty batch establishes a store route");
+        let mut next = self.entries.clone();
+        for entry in staged {
+            next.insert(entry_id(&entry), entry);
+        }
+        let snapshot: Vec<_> = next.values().cloned().collect();
+        self.stores[store_index]
+            .store
+            .push_all(&snapshot, PushAllOptions::default())?;
+        self.entries = next;
+        Ok(())
     }
 
     pub fn put_envelope<T: DatabaseEntry>(&mut self, entry: CultCacheEnvelope) -> Result<T> {
@@ -953,6 +1003,39 @@ mod tests {
         assert_eq!(cache.snapshot().len(), 2);
         assert_eq!(cache.get_required::<Note>("shared")?.title, "same key");
         assert_eq!(cache.get_required::<Settings>("shared")?.theme, "green");
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_batch_publishes_heterogeneous_entries_in_one_snapshot() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("batch.cc");
+        let mut cache = CultCache::new();
+        cache.register_registry(TestEntries)?;
+        cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
+
+        let (settings, _) = cache.prepare_entry(
+            "app",
+            &Settings {
+                theme: "iron".to_string(),
+                retries: 4,
+            },
+        )?;
+        let (note, _) = cache.prepare_entry(
+            "receipt",
+            &Note {
+                title: "committed".to_string(),
+                body: "same snapshot".to_string(),
+            },
+        )?;
+        cache.put_prepared_batch(vec![settings, note])?;
+
+        let mut reloaded = CultCache::new();
+        reloaded.register_registry(TestEntries)?;
+        reloaded.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
+        reloaded.pull_all_backing_stores()?;
+        assert_eq!(reloaded.get_required::<Settings>("app")?.theme, "iron");
+        assert_eq!(reloaded.get_required::<Note>("receipt")?.title, "committed");
         Ok(())
     }
 
