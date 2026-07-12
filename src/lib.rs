@@ -396,6 +396,9 @@ impl SingleFileMessagePackBackingStore {
 
 impl CacheBackingStore for SingleFileMessagePackBackingStore {
     fn pull_all(&self) -> Result<Vec<CultCacheEnvelope>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
         self.with_shared_lock(|| self.read_all_unlocked())
     }
 
@@ -1065,6 +1068,19 @@ mod tests {
         reloaded.pull_all_backing_stores()?;
         assert_eq!(reloaded.get_required::<Settings>("app")?.theme, "iron");
         assert_eq!(reloaded.get_required::<Note>("receipt")?.title, "committed");
+        Ok(())
+    }
+
+    #[test]
+    fn pulling_an_absent_store_does_not_create_its_parent_or_lock() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let missing_parent = temp.path().join("missing-body");
+        let store_path = missing_parent.join("cache.cc");
+        let store = SingleFileMessagePackBackingStore::new(&store_path);
+
+        assert!(store.pull_all()?.is_empty());
+        assert!(!missing_parent.exists());
+        assert!(!store_path.with_file_name("cache.cc.lock").exists());
         Ok(())
     }
 
