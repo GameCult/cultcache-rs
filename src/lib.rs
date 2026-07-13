@@ -353,6 +353,59 @@ impl SingleFileMessagePackBackingStore {
         })
     }
 
+    /// Atomically replaces an exact set of existing envelopes and inserts any
+    /// additional companion envelopes. Every precondition is checked beneath
+    /// the same cross-process lock as the single snapshot write.
+    pub fn compare_and_swap_batch(
+        &self,
+        expected: &[CultCacheEnvelope],
+        replacements: Vec<CultCacheEnvelope>,
+    ) -> Result<bool> {
+        if replacements.is_empty() {
+            return Err(anyhow!(
+                "conditional batch requires a non-empty replacement set"
+            ));
+        }
+        let expected_ids = unique_batch_ids(expected, "expected")?;
+        let replacement_ids = unique_batch_ids(&replacements, "replacement")?;
+        if !expected_ids.is_subset(&replacement_ids) {
+            return Err(anyhow!(
+                "conditional batch must replace every expected identity"
+            ));
+        }
+
+        self.with_exclusive_lock(|| {
+            let mut entries = self.read_all_unlocked()?;
+            for expected_entry in expected {
+                let Some(current) = entries
+                    .iter()
+                    .find(|candidate| entry_id(candidate) == entry_id(expected_entry))
+                else {
+                    return Ok(false);
+                };
+                if current != expected_entry {
+                    return Ok(false);
+                }
+            }
+            for replacement in &replacements {
+                let identity = entry_id(replacement);
+                if !expected_ids.contains(&identity)
+                    && entries
+                        .iter()
+                        .any(|candidate| entry_id(candidate) == identity)
+                {
+                    return Ok(false);
+                }
+            }
+
+            entries.retain(|candidate| !expected_ids.contains(&entry_id(candidate)));
+            entries.extend(replacements);
+            entries.sort_by_key(entry_id);
+            self.write_all_unlocked(&entries)?;
+            Ok(true)
+        })
+    }
+
     fn read_all_unlocked(&self) -> Result<Vec<CultCacheEnvelope>> {
         if !self.path.exists() {
             return Ok(Vec::new());
@@ -435,6 +488,16 @@ impl SingleFileMessagePackBackingStore {
         lock_name.push(".lock");
         self.path.with_file_name(lock_name)
     }
+}
+
+fn unique_batch_ids(entries: &[CultCacheEnvelope], label: &str) -> Result<BTreeSet<String>> {
+    let ids = entries.iter().map(entry_id).collect::<BTreeSet<_>>();
+    if ids.len() != entries.len() {
+        return Err(anyhow!(
+            "conditional batch {label} set contains duplicate identities"
+        ));
+    }
+    Ok(ids)
 }
 
 impl CacheBackingStore for SingleFileMessagePackBackingStore {
@@ -1124,6 +1187,106 @@ mod tests {
         assert!(store.pull_all()?.is_empty());
         assert!(!missing_parent.exists());
         assert!(!store_path.with_file_name("cache.cc.lock").exists());
+        Ok(())
+    }
+
+    fn test_envelope(r#type: &str, key: &str, payload: &[u8]) -> CultCacheEnvelope {
+        CultCacheEnvelope {
+            key: key.to_string(),
+            r#type: r#type.to_string(),
+            payload: payload.to_vec(),
+            stored_at: "2026-07-13T00:00:00Z".to_string(),
+            schema_id: Some(r#type.to_string()),
+        }
+    }
+
+    #[test]
+    fn conditional_batch_replaces_expected_and_inserts_companion_atomically() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("conditional-batch.cc");
+        let mut store = SingleFileMessagePackBackingStore::new(&store_path);
+        let current = test_envelope("model", "current", b"revision-1");
+        store.push(&current)?;
+        let replacement = test_envelope("model", "current", b"revision-2");
+        let companion = test_envelope("receipt", "migration-1", b"applied");
+
+        assert!(store.compare_and_swap_batch(
+            std::slice::from_ref(&current),
+            vec![replacement.clone(), companion.clone()],
+        )?);
+        assert_eq!(store.pull_all()?, vec![replacement, companion]);
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_batch_allows_atomic_first_import_when_identities_are_absent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("conditional-import.cc");
+        let store = SingleFileMessagePackBackingStore::new(&store_path);
+        let model = test_envelope("model", "current", b"revision-1");
+        let receipt = test_envelope("receipt", "migration-1", b"applied");
+
+        assert!(store.compare_and_swap_batch(&[], vec![model.clone(), receipt.clone()])?);
+        assert_eq!(store.pull_all()?, vec![model, receipt]);
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_batch_stale_expected_and_companion_collision_preserve_exact_bytes() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("conditional-refusal.cc");
+        let mut store = SingleFileMessagePackBackingStore::new(&store_path);
+        let current = test_envelope("model", "current", b"revision-1");
+        let occupied = test_envelope("receipt", "migration-1", b"someone-else");
+        store.push(&current)?;
+        store.push(&occupied)?;
+        let before = fs::read(&store_path)?;
+
+        let stale = test_envelope("model", "current", b"stale-copy");
+        let replacement = test_envelope("model", "current", b"revision-2");
+        let fresh_companion = test_envelope("receipt", "migration-2", b"applied");
+        assert!(
+            !store.compare_and_swap_batch(&[stale], vec![replacement.clone(), fresh_companion],)?
+        );
+        assert_eq!(fs::read(&store_path)?, before);
+
+        assert!(!store.compare_and_swap_batch(
+            &[current],
+            vec![
+                replacement,
+                test_envelope("receipt", "migration-1", b"collision")
+            ],
+        )?);
+        assert_eq!(fs::read(&store_path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn conditional_batch_rejects_empty_replacements_and_duplicate_identities() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = SingleFileMessagePackBackingStore::new(temp.path().join("invalid-batch.cc"));
+        let entry = test_envelope("model", "current", b"one");
+
+        assert!(
+            store
+                .compare_and_swap_batch(&[entry.clone()], Vec::new())
+                .is_err()
+        );
+        assert!(
+            store
+                .compare_and_swap_batch(&[], vec![entry.clone(), entry.clone()])
+                .is_err()
+        );
+        assert!(
+            store
+                .compare_and_swap_batch(
+                    &[entry.clone(), entry.clone()],
+                    vec![test_envelope("model", "current", b"two")],
+                )
+                .is_err()
+        );
+        assert!(!store.path().exists());
         Ok(())
     }
 
