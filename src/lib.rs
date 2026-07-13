@@ -310,6 +310,49 @@ impl SingleFileMessagePackBackingStore {
         &self.path
     }
 
+    /// Replaces one exact envelope under the store's cross-process exclusive
+    /// lock. A changed or missing expected envelope returns false without a write.
+    pub fn compare_and_swap_entry(
+        &self,
+        expected: &CultCacheEnvelope,
+        replacement: CultCacheEnvelope,
+    ) -> Result<bool> {
+        self.with_exclusive_lock(|| {
+            let mut entries = self.read_all_unlocked()?;
+            let Some(index) = entries
+                .iter()
+                .position(|candidate| entry_id(candidate) == entry_id(expected))
+            else {
+                return Ok(false);
+            };
+            if entries[index] != *expected {
+                return Ok(false);
+            }
+            entries[index] = replacement;
+            entries.sort_by_key(entry_id);
+            self.write_all_unlocked(&entries)?;
+            Ok(true)
+        })
+    }
+
+    /// Inserts one envelope only when its polymorphic type/key identity is
+    /// absent, under the same cross-process lock used by all single-file writes.
+    pub fn insert_entry_if_absent(&self, entry: CultCacheEnvelope) -> Result<bool> {
+        self.with_exclusive_lock(|| {
+            let mut entries = self.read_all_unlocked()?;
+            if entries
+                .iter()
+                .any(|candidate| entry_id(candidate) == entry_id(&entry))
+            {
+                return Ok(false);
+            }
+            entries.push(entry);
+            entries.sort_by_key(entry_id);
+            self.write_all_unlocked(&entries)?;
+            Ok(true)
+        })
+    }
+
     fn read_all_unlocked(&self) -> Result<Vec<CultCacheEnvelope>> {
         if !self.path.exists() {
             return Ok(Vec::new());
@@ -396,7 +439,7 @@ impl SingleFileMessagePackBackingStore {
 
 impl CacheBackingStore for SingleFileMessagePackBackingStore {
     fn pull_all(&self) -> Result<Vec<CultCacheEnvelope>> {
-        if !self.path.exists() {
+        if !self.path.exists() && !self.lock_path().exists() {
             return Ok(Vec::new());
         }
         self.with_shared_lock(|| self.read_all_unlocked())
