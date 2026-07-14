@@ -614,6 +614,13 @@ impl CultCache {
         Ok(())
     }
 
+    /// Returns the exact envelopes in the currently loaded cache image.
+    /// Callers that need optimistic concurrency can validate typed documents
+    /// and capture CAS expectations from one coherent read.
+    pub fn snapshot_envelopes(&self) -> Vec<CultCacheEnvelope> {
+        self.entries.values().cloned().collect()
+    }
+
     pub fn get<T: DatabaseEntry>(&self, key: &str) -> Result<Option<T>> {
         self.require_entry_type::<T>()?;
         let Some(entry) = self.entries.get(&entry_id_parts(T::TYPE, key)) else {
