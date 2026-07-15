@@ -406,6 +406,32 @@ impl SingleFileMessagePackBackingStore {
         })
     }
 
+    /// Atomically deletes an exact set of envelopes. Any changed or missing
+    /// member refuses the entire deletion without a partial write.
+    pub fn delete_batch_if_unchanged(&self, expected: &[CultCacheEnvelope]) -> Result<bool> {
+        if expected.is_empty() {
+            return Err(anyhow!("conditional delete requires a non-empty expected set"));
+        }
+        let expected_ids = unique_batch_ids(expected, "delete expected")?;
+        self.with_exclusive_lock(|| {
+            let mut entries = self.read_all_unlocked()?;
+            for expected_entry in expected {
+                let Some(current) = entries
+                    .iter()
+                    .find(|candidate| entry_id(candidate) == entry_id(expected_entry))
+                else {
+                    return Ok(false);
+                };
+                if current != expected_entry {
+                    return Ok(false);
+                }
+            }
+            entries.retain(|candidate| !expected_ids.contains(&entry_id(candidate)));
+            self.write_all_unlocked(&entries)?;
+            Ok(true)
+        })
+    }
+
     fn read_all_unlocked(&self) -> Result<Vec<CultCacheEnvelope>> {
         if !self.path.exists() {
             return Ok(Vec::new());
