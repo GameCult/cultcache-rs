@@ -406,11 +406,48 @@ impl SingleFileMessagePackBackingStore {
         })
     }
 
+    /// Atomically appends companions only when the complete backing-store
+    /// snapshot is byte-for-byte unchanged. Unlike identity-scoped CAS, this
+    /// fences predicate cardinality: a concurrently inserted unknown identity
+    /// makes the expected snapshot stale.
+    pub fn append_if_snapshot_unchanged(
+        &self,
+        expected_snapshot: &[CultCacheEnvelope],
+        additions: Vec<CultCacheEnvelope>,
+    ) -> Result<bool> {
+        if additions.is_empty() {
+            return Err(anyhow!("conditional snapshot append requires additions"));
+        }
+        unique_batch_ids(expected_snapshot, "expected snapshot")?;
+        let addition_ids = unique_batch_ids(&additions, "snapshot additions")?;
+        self.with_exclusive_lock(|| {
+            let mut current = self.read_all_unlocked()?;
+            let mut expected = expected_snapshot.to_vec();
+            current.sort_by_key(entry_id);
+            expected.sort_by_key(entry_id);
+            if current != expected {
+                return Ok(false);
+            }
+            if current
+                .iter()
+                .any(|row| addition_ids.contains(&entry_id(row)))
+            {
+                return Ok(false);
+            }
+            current.extend(additions);
+            current.sort_by_key(entry_id);
+            self.write_all_unlocked(&current)?;
+            Ok(true)
+        })
+    }
+
     /// Atomically deletes an exact set of envelopes. Any changed or missing
     /// member refuses the entire deletion without a partial write.
     pub fn delete_batch_if_unchanged(&self, expected: &[CultCacheEnvelope]) -> Result<bool> {
         if expected.is_empty() {
-            return Err(anyhow!("conditional delete requires a non-empty expected set"));
+            return Err(anyhow!(
+                "conditional delete requires a non-empty expected set"
+            ));
         }
         let expected_ids = unique_batch_ids(expected, "delete expected")?;
         self.with_exclusive_lock(|| {
@@ -516,7 +553,10 @@ impl SingleFileMessagePackBackingStore {
     }
 }
 
-fn unique_batch_ids(entries: &[CultCacheEnvelope], label: &str) -> Result<BTreeSet<String>> {
+fn unique_batch_ids(
+    entries: &[CultCacheEnvelope],
+    label: &str,
+) -> Result<BTreeSet<(String, String)>> {
     let ids = entries.iter().map(entry_id).collect::<BTreeSet<_>>();
     if ids.len() != entries.len() {
         return Err(anyhow!(
@@ -568,7 +608,7 @@ struct CultCacheStoreRegistration {
 
 pub struct CultCache {
     definitions: BTreeMap<String, &'static str>,
-    entries: BTreeMap<String, CultCacheEnvelope>,
+    entries: BTreeMap<(String, String), CultCacheEnvelope>,
     stores: Vec<CultCacheStoreRegistration>,
 }
 
@@ -959,12 +999,12 @@ impl Default for CultCache {
     }
 }
 
-fn entry_id(entry: &CultCacheEnvelope) -> String {
+fn entry_id(entry: &CultCacheEnvelope) -> (String, String) {
     entry_id_parts(&entry.r#type, &entry.key)
 }
 
-fn entry_id_parts(r#type: &str, key: &str) -> String {
-    format!("{type}::{key}", type = r#type)
+fn entry_id_parts(r#type: &str, key: &str) -> (String, String) {
+    (r#type.to_string(), key.to_string())
 }
 
 fn now_utc_second() -> String {
@@ -1320,6 +1360,68 @@ mod tests {
                 .is_err()
         );
         assert!(!store.path().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_append_fences_concurrent_unknown_identity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("snapshot-append.cc");
+        let mut store = SingleFileMessagePackBackingStore::new(&store_path);
+        let model = test_envelope("model", "current", b"revision-1");
+        store.push(&model)?;
+        let expected = store.pull_all()?;
+        let duplicate_admission = test_envelope("admission", "unexpected", b"also-current");
+        store.push(&duplicate_admission)?;
+        let before = fs::read(&store_path)?;
+
+        assert!(!store.append_if_snapshot_unchanged(
+            &expected,
+            vec![test_envelope("readiness", "proof", b"ready")],
+        )?);
+        assert_eq!(fs::read(&store_path)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_append_is_order_insensitive_and_refuses_collisions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("snapshot-order.cc");
+        let mut store = SingleFileMessagePackBackingStore::new(&store_path);
+        let a = test_envelope("a", "one", b"1");
+        let b = test_envelope("b", "two", b"2");
+        store.push(&a)?;
+        store.push(&b)?;
+        assert!(store.append_if_snapshot_unchanged(
+            &[b.clone(), a.clone()],
+            vec![test_envelope("proof", "three", b"3")],
+        )?);
+        let current = store.pull_all()?;
+        assert!(!store.append_if_snapshot_unchanged(
+            &current,
+            vec![test_envelope("a", "one", b"collision")],
+        )?);
+        assert!(
+            store
+                .append_if_snapshot_unchanged(&current, Vec::new())
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn type_and_key_identity_is_not_delimiter_ambiguous() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("delimiter-identity.cc");
+        let mut store = SingleFileMessagePackBackingStore::new(&store_path);
+        let left = test_envelope("a::b", "c", b"left");
+        let right = test_envelope("a", "b::c", b"right");
+        store.push(&left)?;
+        store.push(&right)?;
+        let rows = store.pull_all()?;
+        assert_eq!(rows.len(), 2);
+        assert!(rows.contains(&left));
+        assert!(rows.contains(&right));
         Ok(())
     }
 
