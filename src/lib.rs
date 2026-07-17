@@ -1155,6 +1155,69 @@ impl OwnedRedbMessagePackBackingStore {
         }
         Ok(matched)
     }
+
+    /// Atomically replaces and deletes rows only while the complete store
+    /// snapshot remains byte-exact. This is the compaction primitive: a stale
+    /// reader cannot summarize one history while deleting another.
+    pub fn replace_and_delete_if_snapshot_unchanged(
+        &self,
+        expected_snapshot: &[CultCacheEnvelope],
+        replacements: Vec<CultCacheEnvelope>,
+        deletions: &[CultCacheEnvelope],
+    ) -> Result<bool> {
+        if replacements.is_empty() || deletions.is_empty() {
+            return Err(anyhow!(
+                "conditional compaction requires replacements and deletions"
+            ));
+        }
+        let expected_ids = unique_batch_ids(expected_snapshot, "expected snapshot")?;
+        let replacement_ids = unique_batch_ids(&replacements, "replacement")?;
+        let deletion_ids = unique_batch_ids(deletions, "deletion")?;
+        if !deletion_ids.is_subset(&expected_ids) {
+            return Err(anyhow!(
+                "compaction deletion is absent from expected snapshot"
+            ));
+        }
+        if !deletion_ids.is_disjoint(&replacement_ids) {
+            return Err(anyhow!("compaction cannot replace and delete one identity"));
+        }
+        let write = self.inner.database.begin_write()?;
+        let matched = {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            let mut current = read_all_redb(&table)?;
+            let mut expected = expected_snapshot.to_vec();
+            current.sort_by_key(entry_id);
+            expected.sort_by_key(entry_id);
+            let mut valid = current == expected;
+            if valid {
+                for row in &replacements {
+                    if !expected_ids.contains(&entry_id(row))
+                        && read_redb_entry(&table, row)?.is_some()
+                    {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid {
+                for identity in deletion_ids {
+                    let key = rmp_serde::to_vec(&identity)
+                        .context("failed to encode CultCache identity")?;
+                    table.remove(key.as_slice())?;
+                }
+                for row in &replacements {
+                    insert_redb_entry(&mut table, row)?;
+                }
+            }
+            valid
+        };
+        if matched {
+            write.commit()?;
+        } else {
+            write.abort()?;
+        }
+        Ok(matched)
+    }
 }
 
 impl CacheBackingStore for OwnedRedbMessagePackBackingStore {
@@ -2168,6 +2231,38 @@ mod tests {
             vec![first_two.clone(), second_two.clone(), companion.clone()],
         )?);
         assert_eq!(owner.pull_all()?, vec![first_two, second_two, companion]);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_redb_compaction_refuses_stale_snapshot_and_atomically_replaces_and_deletes()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut owner =
+            OwnedRedbMessagePackBackingStore::new(temp.path().join("compact-owned.cc"))?;
+        let old_head = test_envelope("retention", "current", b"one");
+        let retired_a = test_envelope("claim", "a", b"terminal");
+        let retired_b = test_envelope("receipt", "a", b"terminal");
+        owner.push(&old_head)?;
+        owner.push(&retired_a)?;
+        owner.push(&retired_b)?;
+        let stale = owner.pull_all()?;
+        let concurrent = test_envelope("claim", "concurrent", b"running");
+        assert!(owner.insert_entry_if_absent(concurrent.clone())?);
+        let new_head = test_envelope("retention", "current", b"two");
+        assert!(!owner.replace_and_delete_if_snapshot_unchanged(
+            &stale,
+            vec![new_head.clone()],
+            &[retired_a.clone(), retired_b.clone()],
+        )?);
+        assert!(owner.pull_all()?.contains(&retired_a));
+        let exact = owner.pull_all()?;
+        assert!(owner.replace_and_delete_if_snapshot_unchanged(
+            &exact,
+            vec![new_head.clone()],
+            &[retired_a, retired_b],
+        )?);
+        assert_eq!(owner.pull_all()?, vec![concurrent, new_head]);
         Ok(())
     }
 
