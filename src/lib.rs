@@ -13,6 +13,8 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::path::PathBuf;
 
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+
 extern crate self as cultcache_rs;
 
 pub use cultcache_rs_derive::DatabaseEntry;
@@ -598,6 +600,318 @@ impl CacheBackingStore for SingleFileMessagePackBackingStore {
             entries.sort_by_key(entry_id);
             self.write_all_unlocked(&entries)
         })
+    }
+}
+
+const REDB_ENVELOPES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("cultcache_envelopes");
+
+/// Transactional keyed CultCache storage. Each polymorphic `(type, key)`
+/// identity is an independent redb row whose value is the exact MessagePack
+/// serialization of its `CultCacheEnvelope`.
+#[derive(Clone)]
+pub struct RedbMessagePackBackingStore {
+    path: PathBuf,
+}
+
+impl std::fmt::Debug for RedbMessagePackBackingStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RedbMessagePackBackingStore")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RedbMessagePackBackingStore {
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let store = Self { path };
+        let database = store.open_database()?;
+        let write = database.begin_write()?;
+        {
+            write.open_table(REDB_ENVELOPES)?;
+        }
+        write.commit()?;
+        Ok(store)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn open_database(&self) -> Result<Database> {
+        Database::create(&self.path)
+            .with_context(|| format!("failed to open redb CultCache {}", self.path.display()))
+    }
+
+    pub fn compare_and_swap_entry(
+        &self,
+        expected: &CultCacheEnvelope,
+        replacement: CultCacheEnvelope,
+    ) -> Result<bool> {
+        if entry_id(expected) != entry_id(&replacement) {
+            return Err(anyhow!("entry CAS replacement must preserve identity"));
+        }
+        let database = self.open_database()?;
+        let write = database.begin_write()?;
+        let matched = {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            if read_redb_entry(&table, expected)? != Some(expected.clone()) {
+                false
+            } else {
+                insert_redb_entry(&mut table, &replacement)?;
+                true
+            }
+        };
+        if matched {
+            write.commit()?;
+        } else {
+            write.abort()?;
+        }
+        Ok(matched)
+    }
+
+    pub fn insert_entry_if_absent(&self, entry: CultCacheEnvelope) -> Result<bool> {
+        let database = self.open_database()?;
+        let write = database.begin_write()?;
+        let inserted = {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            let key = redb_identity(&entry)?;
+            if table.get(key.as_slice())?.is_some() {
+                false
+            } else {
+                insert_redb_entry(&mut table, &entry)?;
+                true
+            }
+        };
+        if inserted {
+            write.commit()?;
+        } else {
+            write.abort()?;
+        }
+        Ok(inserted)
+    }
+
+    pub fn compare_and_swap_batch(
+        &self,
+        expected: &[CultCacheEnvelope],
+        replacements: Vec<CultCacheEnvelope>,
+    ) -> Result<bool> {
+        if replacements.is_empty() {
+            return Err(anyhow!(
+                "conditional batch requires a non-empty replacement set"
+            ));
+        }
+        let expected_ids = unique_batch_ids(expected, "expected")?;
+        let replacement_ids = unique_batch_ids(&replacements, "replacement")?;
+        if !expected_ids.is_subset(&replacement_ids) {
+            return Err(anyhow!(
+                "conditional batch must replace every expected identity"
+            ));
+        }
+        let database = self.open_database()?;
+        let write = database.begin_write()?;
+        let matched = {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            let mut valid = true;
+            for row in expected {
+                if read_redb_entry(&table, row)? != Some(row.clone()) {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                for row in &replacements {
+                    if !expected_ids.contains(&entry_id(row))
+                        && read_redb_entry(&table, row)?.is_some()
+                    {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid {
+                for row in &replacements {
+                    insert_redb_entry(&mut table, row)?;
+                }
+            }
+            valid
+        };
+        if matched {
+            write.commit()?;
+        } else {
+            write.abort()?;
+        }
+        Ok(matched)
+    }
+
+    pub fn append_if_snapshot_unchanged(
+        &self,
+        expected_snapshot: &[CultCacheEnvelope],
+        additions: Vec<CultCacheEnvelope>,
+    ) -> Result<bool> {
+        if additions.is_empty() {
+            return Err(anyhow!("conditional snapshot append requires additions"));
+        }
+        unique_batch_ids(expected_snapshot, "expected snapshot")?;
+        let addition_ids = unique_batch_ids(&additions, "snapshot additions")?;
+        let database = self.open_database()?;
+        let write = database.begin_write()?;
+        let matched = {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            let mut current = read_all_redb(&table)?;
+            let mut expected = expected_snapshot.to_vec();
+            current.sort_by_key(entry_id);
+            expected.sort_by_key(entry_id);
+            let valid = current == expected
+                && !current
+                    .iter()
+                    .any(|row| addition_ids.contains(&entry_id(row)));
+            if valid {
+                for row in &additions {
+                    insert_redb_entry(&mut table, row)?;
+                }
+            }
+            valid
+        };
+        if matched {
+            write.commit()?;
+        } else {
+            write.abort()?;
+        }
+        Ok(matched)
+    }
+
+    pub fn delete_batch_if_unchanged(&self, expected: &[CultCacheEnvelope]) -> Result<bool> {
+        if expected.is_empty() {
+            return Err(anyhow!(
+                "conditional delete requires a non-empty expected set"
+            ));
+        }
+        unique_batch_ids(expected, "delete expected")?;
+        let database = self.open_database()?;
+        let write = database.begin_write()?;
+        let matched = {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            let mut valid = true;
+            for row in expected {
+                if read_redb_entry(&table, row)? != Some(row.clone()) {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                for row in expected {
+                    let key = redb_identity(row)?;
+                    table.remove(key.as_slice())?;
+                }
+            }
+            valid
+        };
+        if matched {
+            write.commit()?;
+        } else {
+            write.abort()?;
+        }
+        Ok(matched)
+    }
+}
+
+fn redb_identity(entry: &CultCacheEnvelope) -> Result<Vec<u8>> {
+    rmp_serde::to_vec(&entry_id(entry)).context("failed to encode CultCache identity")
+}
+
+fn read_redb_entry(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    identity: &CultCacheEnvelope,
+) -> Result<Option<CultCacheEnvelope>> {
+    let key = redb_identity(identity)?;
+    table
+        .get(key.as_slice())?
+        .map(|value| {
+            rmp_serde::from_slice(value.value()).context("failed to decode redb CultCache envelope")
+        })
+        .transpose()
+}
+
+fn insert_redb_entry(
+    table: &mut redb::Table<&[u8], &[u8]>,
+    entry: &CultCacheEnvelope,
+) -> Result<()> {
+    let key = redb_identity(entry)?;
+    let value = rmp_serde::to_vec(entry).context("failed to encode redb CultCache envelope")?;
+    table.insert(key.as_slice(), value.as_slice())?;
+    Ok(())
+}
+
+fn read_all_redb(
+    table: &impl ReadableTable<&'static [u8], &'static [u8]>,
+) -> Result<Vec<CultCacheEnvelope>> {
+    let mut entries = table
+        .iter()?
+        .map(|row| {
+            let (_, value) = row?;
+            rmp_serde::from_slice(value.value()).context("failed to decode redb CultCache envelope")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by_key(entry_id);
+    Ok(entries)
+}
+
+impl CacheBackingStore for RedbMessagePackBackingStore {
+    fn pull_all(&self) -> Result<Vec<CultCacheEnvelope>> {
+        let database = self.open_database()?;
+        let read = database.begin_read()?;
+        let table = read.open_table(REDB_ENVELOPES)?;
+        read_all_redb(&table)
+    }
+
+    fn push(&mut self, entry: &CultCacheEnvelope) -> Result<()> {
+        let database = self.open_database()?;
+        let write = database.begin_write()?;
+        {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            insert_redb_entry(&mut table, entry)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    fn delete(&mut self, entry: &CultCacheEnvelope) -> Result<()> {
+        let database = self.open_database()?;
+        let write = database.begin_write()?;
+        {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            let key = redb_identity(entry)?;
+            table.remove(key.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    fn push_all(&mut self, entries: &[CultCacheEnvelope], _options: PushAllOptions) -> Result<()> {
+        unique_batch_ids(entries, "push all")?;
+        let database = self.open_database()?;
+        let write = database.begin_write()?;
+        {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            let keys = table
+                .iter()?
+                .map(|row| Ok(row?.0.value().to_vec()))
+                .collect::<Result<Vec<_>>>()?;
+            for key in keys {
+                table.remove(key.as_slice())?;
+            }
+            for entry in entries {
+                insert_redb_entry(&mut table, entry)?;
+            }
+        }
+        write.commit()?;
+        Ok(())
     }
 }
 
@@ -1271,6 +1585,93 @@ mod tests {
             stored_at: "2026-07-13T00:00:00Z".to_string(),
             schema_id: Some(r#type.to_string()),
         }
+    }
+
+    #[test]
+    fn redb_store_crud_and_reopen_preserve_polymorphic_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("keyed.cc");
+        let model = test_envelope("model", "shared", b"one");
+        let receipt = test_envelope("receipt", "shared", b"two");
+        {
+            let mut store = RedbMessagePackBackingStore::new(&path)?;
+            store.push(&model)?;
+            store.push(&receipt)?;
+            assert_eq!(store.pull_all()?.len(), 2);
+            store.delete(&receipt)?;
+        }
+        let reopened = RedbMessagePackBackingStore::new(&path)?;
+        assert_eq!(reopened.pull_all()?, vec![model]);
+        Ok(())
+    }
+
+    #[test]
+    fn redb_exact_cas_refuses_stale_value_without_mutation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut store = RedbMessagePackBackingStore::new(temp.path().join("cas.cc"))?;
+        let current = test_envelope("model", "current", b"one");
+        store.push(&current)?;
+        let stale = test_envelope("model", "current", b"stale");
+        let replacement = test_envelope("model", "current", b"two");
+        assert!(!store.compare_and_swap_entry(&stale, replacement.clone())?);
+        assert_eq!(store.pull_all()?, vec![current.clone()]);
+        assert!(store.compare_and_swap_entry(&current, replacement.clone())?);
+        assert_eq!(store.pull_all()?, vec![replacement]);
+        Ok(())
+    }
+
+    #[test]
+    fn redb_batch_is_atomic_and_stale_member_refuses_every_write() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut store = RedbMessagePackBackingStore::new(temp.path().join("batch.cc"))?;
+        let first = test_envelope("model", "first", b"one");
+        let second = test_envelope("model", "second", b"one");
+        store.push(&first)?;
+        store.push(&second)?;
+        let stale_second = test_envelope("model", "second", b"stale");
+        let first_two = test_envelope("model", "first", b"two");
+        let second_two = test_envelope("model", "second", b"two");
+        let receipt = test_envelope("receipt", "batch", b"committed");
+        assert!(!store.compare_and_swap_batch(
+            &[first.clone(), stale_second],
+            vec![first_two.clone(), second_two.clone(), receipt.clone()],
+        )?);
+        assert_eq!(store.pull_all()?, vec![first.clone(), second.clone()]);
+        assert!(store.compare_and_swap_batch(
+            &[first, second],
+            vec![first_two.clone(), second_two.clone(), receipt.clone()],
+        )?);
+        assert_eq!(store.pull_all()?, vec![first_two, second_two, receipt]);
+        Ok(())
+    }
+
+    #[test]
+    fn redb_entry_cas_does_not_depend_on_unrelated_snapshot_changes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = RedbMessagePackBackingStore::new(temp.path().join("independent.cc"))?;
+        let current = test_envelope("model", "current", b"one");
+        assert!(store.insert_entry_if_absent(current.clone())?);
+        let unrelated = test_envelope("event", "later", b"noise");
+        assert!(store.insert_entry_if_absent(unrelated.clone())?);
+        let replacement = test_envelope("model", "current", b"two");
+        assert!(store.compare_and_swap_entry(&current, replacement.clone())?);
+        assert_eq!(store.pull_all()?, vec![unrelated, replacement]);
+        Ok(())
+    }
+
+    #[test]
+    fn redb_fresh_handles_share_one_database_for_the_same_cultcache_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("shared.cc");
+        let mut first = RedbMessagePackBackingStore::new(&path)?;
+        let second = RedbMessagePackBackingStore::new(&path)?;
+        let initial = test_envelope("model", "current", b"one");
+        first.push(&initial)?;
+        assert_eq!(second.pull_all()?, vec![initial.clone()]);
+        let replacement = test_envelope("model", "current", b"two");
+        assert!(second.compare_and_swap_entry(&initial, replacement.clone())?);
+        assert_eq!(first.pull_all()?, vec![replacement]);
+        Ok(())
     }
 
     #[test]
