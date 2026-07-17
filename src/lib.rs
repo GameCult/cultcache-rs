@@ -625,17 +625,22 @@ impl std::fmt::Debug for RedbMessagePackBackingStore {
 impl RedbMessagePackBackingStore {
     pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         let store = Self { path };
-        let database = store.open_database()?;
-        let write = database.begin_write()?;
-        {
-            write.open_table(REDB_ENVELOPES)?;
-        }
-        write.commit()?;
+        store.with_database(|database| {
+            let write = database.begin_write()?;
+            {
+                write.open_table(REDB_ENVELOPES)?;
+            }
+            write.commit()?;
+            Ok(())
+        })?;
         Ok(store)
     }
 
@@ -648,6 +653,44 @@ impl RedbMessagePackBackingStore {
             .with_context(|| format!("failed to open redb CultCache {}", self.path.display()))
     }
 
+    /// redb permits one open writable database handle per path. The external
+    /// CultCache lock therefore owns the complete open/transaction/close
+    /// interval, preserving the fresh-handle and cross-process construction
+    /// model used by the other backing store.
+    fn with_database<T>(&self, action: impl FnOnce(&Database) -> Result<T>) -> Result<T> {
+        let lock_path = self.lock_path();
+        if let Some(parent) = lock_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open {}", lock_path.display()))?;
+        fs2::FileExt::lock_exclusive(&lock)
+            .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+        let result = self.open_database().and_then(|database| action(&database));
+        fs2::FileExt::unlock(&lock)
+            .with_context(|| format!("failed to unlock {}", lock_path.display()))?;
+        result
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        let mut lock_name = self
+            .path
+            .file_name()
+            .map(|value| value.to_os_string())
+            .unwrap_or_else(|| "cultcache.cc".into());
+        lock_name.push(".lock");
+        self.path.with_file_name(lock_name)
+    }
+
     pub fn compare_and_swap_entry(
         &self,
         expected: &CultCacheEnvelope,
@@ -656,44 +699,46 @@ impl RedbMessagePackBackingStore {
         if entry_id(expected) != entry_id(&replacement) {
             return Err(anyhow!("entry CAS replacement must preserve identity"));
         }
-        let database = self.open_database()?;
-        let write = database.begin_write()?;
-        let matched = {
-            let mut table = write.open_table(REDB_ENVELOPES)?;
-            if read_redb_entry(&table, expected)? != Some(expected.clone()) {
-                false
+        self.with_database(|database| {
+            let write = database.begin_write()?;
+            let matched = {
+                let mut table = write.open_table(REDB_ENVELOPES)?;
+                if read_redb_entry(&table, expected)? != Some(expected.clone()) {
+                    false
+                } else {
+                    insert_redb_entry(&mut table, &replacement)?;
+                    true
+                }
+            };
+            if matched {
+                write.commit()?;
             } else {
-                insert_redb_entry(&mut table, &replacement)?;
-                true
+                write.abort()?;
             }
-        };
-        if matched {
-            write.commit()?;
-        } else {
-            write.abort()?;
-        }
-        Ok(matched)
+            Ok(matched)
+        })
     }
 
     pub fn insert_entry_if_absent(&self, entry: CultCacheEnvelope) -> Result<bool> {
-        let database = self.open_database()?;
-        let write = database.begin_write()?;
-        let inserted = {
-            let mut table = write.open_table(REDB_ENVELOPES)?;
-            let key = redb_identity(&entry)?;
-            if table.get(key.as_slice())?.is_some() {
-                false
+        self.with_database(|database| {
+            let write = database.begin_write()?;
+            let inserted = {
+                let mut table = write.open_table(REDB_ENVELOPES)?;
+                let key = redb_identity(&entry)?;
+                if table.get(key.as_slice())?.is_some() {
+                    false
+                } else {
+                    insert_redb_entry(&mut table, &entry)?;
+                    true
+                }
+            };
+            if inserted {
+                write.commit()?;
             } else {
-                insert_redb_entry(&mut table, &entry)?;
-                true
+                write.abort()?;
             }
-        };
-        if inserted {
-            write.commit()?;
-        } else {
-            write.abort()?;
-        }
-        Ok(inserted)
+            Ok(inserted)
+        })
     }
 
     pub fn compare_and_swap_batch(
@@ -713,40 +758,41 @@ impl RedbMessagePackBackingStore {
                 "conditional batch must replace every expected identity"
             ));
         }
-        let database = self.open_database()?;
-        let write = database.begin_write()?;
-        let matched = {
-            let mut table = write.open_table(REDB_ENVELOPES)?;
-            let mut valid = true;
-            for row in expected {
-                if read_redb_entry(&table, row)? != Some(row.clone()) {
-                    valid = false;
-                    break;
-                }
-            }
-            if valid {
-                for row in &replacements {
-                    if !expected_ids.contains(&entry_id(row))
-                        && read_redb_entry(&table, row)?.is_some()
-                    {
+        self.with_database(|database| {
+            let write = database.begin_write()?;
+            let matched = {
+                let mut table = write.open_table(REDB_ENVELOPES)?;
+                let mut valid = true;
+                for row in expected {
+                    if read_redb_entry(&table, row)? != Some(row.clone()) {
                         valid = false;
                         break;
                     }
                 }
-            }
-            if valid {
-                for row in &replacements {
-                    insert_redb_entry(&mut table, row)?;
+                if valid {
+                    for row in &replacements {
+                        if !expected_ids.contains(&entry_id(row))
+                            && read_redb_entry(&table, row)?.is_some()
+                        {
+                            valid = false;
+                            break;
+                        }
+                    }
                 }
+                if valid {
+                    for row in &replacements {
+                        insert_redb_entry(&mut table, row)?;
+                    }
+                }
+                valid
+            };
+            if matched {
+                write.commit()?;
+            } else {
+                write.abort()?;
             }
-            valid
-        };
-        if matched {
-            write.commit()?;
-        } else {
-            write.abort()?;
-        }
-        Ok(matched)
+            Ok(matched)
+        })
     }
 
     pub fn append_if_snapshot_unchanged(
@@ -759,31 +805,32 @@ impl RedbMessagePackBackingStore {
         }
         unique_batch_ids(expected_snapshot, "expected snapshot")?;
         let addition_ids = unique_batch_ids(&additions, "snapshot additions")?;
-        let database = self.open_database()?;
-        let write = database.begin_write()?;
-        let matched = {
-            let mut table = write.open_table(REDB_ENVELOPES)?;
-            let mut current = read_all_redb(&table)?;
-            let mut expected = expected_snapshot.to_vec();
-            current.sort_by_key(entry_id);
-            expected.sort_by_key(entry_id);
-            let valid = current == expected
-                && !current
-                    .iter()
-                    .any(|row| addition_ids.contains(&entry_id(row)));
-            if valid {
-                for row in &additions {
-                    insert_redb_entry(&mut table, row)?;
+        self.with_database(|database| {
+            let write = database.begin_write()?;
+            let matched = {
+                let mut table = write.open_table(REDB_ENVELOPES)?;
+                let mut current = read_all_redb(&table)?;
+                let mut expected = expected_snapshot.to_vec();
+                current.sort_by_key(entry_id);
+                expected.sort_by_key(entry_id);
+                let valid = current == expected
+                    && !current
+                        .iter()
+                        .any(|row| addition_ids.contains(&entry_id(row)));
+                if valid {
+                    for row in &additions {
+                        insert_redb_entry(&mut table, row)?;
+                    }
                 }
+                valid
+            };
+            if matched {
+                write.commit()?;
+            } else {
+                write.abort()?;
             }
-            valid
-        };
-        if matched {
-            write.commit()?;
-        } else {
-            write.abort()?;
-        }
-        Ok(matched)
+            Ok(matched)
+        })
     }
 
     pub fn delete_batch_if_unchanged(&self, expected: &[CultCacheEnvelope]) -> Result<bool> {
@@ -793,31 +840,32 @@ impl RedbMessagePackBackingStore {
             ));
         }
         unique_batch_ids(expected, "delete expected")?;
-        let database = self.open_database()?;
-        let write = database.begin_write()?;
-        let matched = {
-            let mut table = write.open_table(REDB_ENVELOPES)?;
-            let mut valid = true;
-            for row in expected {
-                if read_redb_entry(&table, row)? != Some(row.clone()) {
-                    valid = false;
-                    break;
-                }
-            }
-            if valid {
+        self.with_database(|database| {
+            let write = database.begin_write()?;
+            let matched = {
+                let mut table = write.open_table(REDB_ENVELOPES)?;
+                let mut valid = true;
                 for row in expected {
-                    let key = redb_identity(row)?;
-                    table.remove(key.as_slice())?;
+                    if read_redb_entry(&table, row)? != Some(row.clone()) {
+                        valid = false;
+                        break;
+                    }
                 }
+                if valid {
+                    for row in expected {
+                        let key = redb_identity(row)?;
+                        table.remove(key.as_slice())?;
+                    }
+                }
+                valid
+            };
+            if matched {
+                write.commit()?;
+            } else {
+                write.abort()?;
             }
-            valid
-        };
-        if matched {
-            write.commit()?;
-        } else {
-            write.abort()?;
-        }
-        Ok(matched)
+            Ok(matched)
+        })
     }
 }
 
@@ -864,54 +912,58 @@ fn read_all_redb(
 
 impl CacheBackingStore for RedbMessagePackBackingStore {
     fn pull_all(&self) -> Result<Vec<CultCacheEnvelope>> {
-        let database = self.open_database()?;
-        let read = database.begin_read()?;
-        let table = read.open_table(REDB_ENVELOPES)?;
-        read_all_redb(&table)
+        self.with_database(|database| {
+            let read = database.begin_read()?;
+            let table = read.open_table(REDB_ENVELOPES)?;
+            read_all_redb(&table)
+        })
     }
 
     fn push(&mut self, entry: &CultCacheEnvelope) -> Result<()> {
-        let database = self.open_database()?;
-        let write = database.begin_write()?;
-        {
-            let mut table = write.open_table(REDB_ENVELOPES)?;
-            insert_redb_entry(&mut table, entry)?;
-        }
-        write.commit()?;
-        Ok(())
+        self.with_database(|database| {
+            let write = database.begin_write()?;
+            {
+                let mut table = write.open_table(REDB_ENVELOPES)?;
+                insert_redb_entry(&mut table, entry)?;
+            }
+            write.commit()?;
+            Ok(())
+        })
     }
 
     fn delete(&mut self, entry: &CultCacheEnvelope) -> Result<()> {
-        let database = self.open_database()?;
-        let write = database.begin_write()?;
-        {
-            let mut table = write.open_table(REDB_ENVELOPES)?;
-            let key = redb_identity(entry)?;
-            table.remove(key.as_slice())?;
-        }
-        write.commit()?;
-        Ok(())
+        self.with_database(|database| {
+            let write = database.begin_write()?;
+            {
+                let mut table = write.open_table(REDB_ENVELOPES)?;
+                let key = redb_identity(entry)?;
+                table.remove(key.as_slice())?;
+            }
+            write.commit()?;
+            Ok(())
+        })
     }
 
     fn push_all(&mut self, entries: &[CultCacheEnvelope], _options: PushAllOptions) -> Result<()> {
         unique_batch_ids(entries, "push all")?;
-        let database = self.open_database()?;
-        let write = database.begin_write()?;
-        {
-            let mut table = write.open_table(REDB_ENVELOPES)?;
-            let keys = table
-                .iter()?
-                .map(|row| Ok(row?.0.value().to_vec()))
-                .collect::<Result<Vec<_>>>()?;
-            for key in keys {
-                table.remove(key.as_slice())?;
+        self.with_database(|database| {
+            let write = database.begin_write()?;
+            {
+                let mut table = write.open_table(REDB_ENVELOPES)?;
+                let keys = table
+                    .iter()?
+                    .map(|row| Ok(row?.0.value().to_vec()))
+                    .collect::<Result<Vec<_>>>()?;
+                for key in keys {
+                    table.remove(key.as_slice())?;
+                }
+                for entry in entries {
+                    insert_redb_entry(&mut table, entry)?;
+                }
             }
-            for entry in entries {
-                insert_redb_entry(&mut table, entry)?;
-            }
-        }
-        write.commit()?;
-        Ok(())
+            write.commit()?;
+            Ok(())
+        })
     }
 }
 
@@ -1671,6 +1723,60 @@ mod tests {
         let replacement = test_envelope("model", "current", b"two");
         assert!(second.compare_and_swap_entry(&initial, replacement.clone())?);
         assert_eq!(first.pull_all()?, vec![replacement]);
+        Ok(())
+    }
+
+    #[test]
+    fn redb_overlapping_fresh_handles_serialize_the_database_open_interval() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("contended.cc");
+        let first = RedbMessagePackBackingStore::new(&path)?;
+        let second = RedbMessagePackBackingStore::new(&path)?;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let first_barrier = barrier.clone();
+        let first_thread = std::thread::spawn(move || -> Result<()> {
+            first_barrier.wait();
+            for index in 0..32 {
+                first.insert_entry_if_absent(test_envelope(
+                    "event",
+                    &format!("first-{index}"),
+                    b"first",
+                ))?;
+            }
+            Ok(())
+        });
+        let second_barrier = barrier.clone();
+        let second_thread = std::thread::spawn(move || -> Result<()> {
+            second_barrier.wait();
+            for index in 0..32 {
+                second.insert_entry_if_absent(test_envelope(
+                    "event",
+                    &format!("second-{index}"),
+                    b"second",
+                ))?;
+            }
+            Ok(())
+        });
+        barrier.wait();
+        first_thread.join().expect("first redb writer")?;
+        second_thread.join().expect("second redb writer")?;
+        assert_eq!(
+            RedbMessagePackBackingStore::new(path)?.pull_all()?.len(),
+            64
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn redb_accepts_a_bare_relative_cultcache_path() -> Result<()> {
+        let name = format!("cultcache-redb-relative-{}.cc", uuid::Uuid::new_v4());
+        let path = PathBuf::from(&name);
+        let lock_path = PathBuf::from(format!("{name}.lock"));
+        let store = RedbMessagePackBackingStore::new(&path)?;
+        assert!(store.insert_entry_if_absent(test_envelope("model", "current", b"one"))?);
+        assert_eq!(store.pull_all()?.len(), 1);
+        fs::remove_file(path)?;
+        fs::remove_file(lock_path)?;
         Ok(())
     }
 
