@@ -1,6 +1,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::bail;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::any::Any;
@@ -12,6 +13,7 @@ use std::fs::OpenOptions;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
@@ -869,6 +871,382 @@ impl RedbMessagePackBackingStore {
     }
 }
 
+struct OwnedRedbInner {
+    database: Database,
+    _owner_lock: File,
+    file_identity: String,
+}
+
+/// A pinned redb store for one long-lived service owner. Unlike the transient
+/// redb store, this handle holds the CultCache external lock, an open file
+/// handle, and the redb database for its entire lifetime. Clones share that
+/// exact ownership authority.
+#[derive(Clone)]
+pub struct OwnedRedbMessagePackBackingStore {
+    path: PathBuf,
+    inner: Arc<OwnedRedbInner>,
+}
+
+impl std::fmt::Debug for OwnedRedbMessagePackBackingStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OwnedRedbMessagePackBackingStore")
+            .field("path", &self.path)
+            .field("file_identity", &self.inner.file_identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OwnedRedbMessagePackBackingStore {
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let lock_path = redb_lock_path(&path);
+        let owner_lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open {}", lock_path.display()))?;
+        fs2::FileExt::try_lock_exclusive(&owner_lock).with_context(|| {
+            format!(
+                "redb CultCache {} already has an active owner",
+                path.display()
+            )
+        })?;
+
+        // Give redb ownership of the already pinned file, structurally closing
+        // path substitution during database creation. The post-open identity
+        // comparison separately verifies that the pathname still names it.
+        let database_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to pin redb CultCache {}", path.display()))?;
+        let held_identity = file_identity_from_file(&database_file)?;
+        let database = Database::builder()
+            .create_file(database_file)
+            .with_context(|| format!("failed to open redb CultCache {}", path.display()))?;
+        let path_identity_file = File::open(&path)?;
+        let path_identity = file_identity_from_file(&path_identity_file)?;
+        if held_identity != path_identity {
+            bail!(
+                "redb CultCache path identity changed while opening: held {held_identity}, path {path_identity}"
+            );
+        }
+        let write = database.begin_write()?;
+        {
+            write.open_table(REDB_ENVELOPES)?;
+        }
+        write.commit()?;
+        Ok(Self {
+            path,
+            inner: Arc::new(OwnedRedbInner {
+                database,
+                _owner_lock: owner_lock,
+                file_identity: held_identity,
+            }),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn file_identity(&self) -> &str {
+        &self.inner.file_identity
+    }
+
+    pub fn require_file_identity(&self, expected: &str) -> Result<()> {
+        if expected != self.file_identity() {
+            bail!(
+                "redb CultCache file identity mismatch: expected {expected}, owned {}",
+                self.file_identity()
+            );
+        }
+        Ok(())
+    }
+
+    pub fn validate_path_identity(&self) -> Result<()> {
+        let current_file = File::open(&self.path)
+            .with_context(|| format!("owned redb path {} is missing", self.path.display()))?;
+        let current = file_identity_from_file(&current_file)?;
+        self.require_file_identity(&current).with_context(|| {
+            format!(
+                "owned redb path {} no longer names the pinned file",
+                self.path.display()
+            )
+        })
+    }
+
+    pub fn compare_and_swap_entry(
+        &self,
+        expected: &CultCacheEnvelope,
+        replacement: CultCacheEnvelope,
+    ) -> Result<bool> {
+        if entry_id(expected) != entry_id(&replacement) {
+            return Err(anyhow!("entry CAS replacement must preserve identity"));
+        }
+        let write = self.inner.database.begin_write()?;
+        let matched = {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            if read_redb_entry(&table, expected)? != Some(expected.clone()) {
+                false
+            } else {
+                insert_redb_entry(&mut table, &replacement)?;
+                true
+            }
+        };
+        if matched {
+            write.commit()?;
+        } else {
+            write.abort()?;
+        }
+        Ok(matched)
+    }
+
+    pub fn insert_entry_if_absent(&self, entry: CultCacheEnvelope) -> Result<bool> {
+        let write = self.inner.database.begin_write()?;
+        let inserted = {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            let key = redb_identity(&entry)?;
+            if table.get(key.as_slice())?.is_some() {
+                false
+            } else {
+                insert_redb_entry(&mut table, &entry)?;
+                true
+            }
+        };
+        if inserted {
+            write.commit()?;
+        } else {
+            write.abort()?;
+        }
+        Ok(inserted)
+    }
+
+    pub fn compare_and_swap_batch(
+        &self,
+        expected: &[CultCacheEnvelope],
+        replacements: Vec<CultCacheEnvelope>,
+    ) -> Result<bool> {
+        if replacements.is_empty() {
+            return Err(anyhow!(
+                "conditional batch requires a non-empty replacement set"
+            ));
+        }
+        let expected_ids = unique_batch_ids(expected, "expected")?;
+        let replacement_ids = unique_batch_ids(&replacements, "replacement")?;
+        if !expected_ids.is_subset(&replacement_ids) {
+            return Err(anyhow!(
+                "conditional batch must replace every expected identity"
+            ));
+        }
+        let write = self.inner.database.begin_write()?;
+        let matched = {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            let mut valid = true;
+            for row in expected {
+                if read_redb_entry(&table, row)? != Some(row.clone()) {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                for row in &replacements {
+                    if !expected_ids.contains(&entry_id(row))
+                        && read_redb_entry(&table, row)?.is_some()
+                    {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid {
+                for row in &replacements {
+                    insert_redb_entry(&mut table, row)?;
+                }
+            }
+            valid
+        };
+        if matched {
+            write.commit()?;
+        } else {
+            write.abort()?;
+        }
+        Ok(matched)
+    }
+
+    pub fn append_if_snapshot_unchanged(
+        &self,
+        expected_snapshot: &[CultCacheEnvelope],
+        additions: Vec<CultCacheEnvelope>,
+    ) -> Result<bool> {
+        if additions.is_empty() {
+            return Err(anyhow!("conditional snapshot append requires additions"));
+        }
+        unique_batch_ids(expected_snapshot, "expected snapshot")?;
+        let addition_ids = unique_batch_ids(&additions, "snapshot additions")?;
+        let write = self.inner.database.begin_write()?;
+        let matched = {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            let mut current = read_all_redb(&table)?;
+            let mut expected = expected_snapshot.to_vec();
+            current.sort_by_key(entry_id);
+            expected.sort_by_key(entry_id);
+            let valid = current == expected
+                && !current
+                    .iter()
+                    .any(|row| addition_ids.contains(&entry_id(row)));
+            if valid {
+                for row in &additions {
+                    insert_redb_entry(&mut table, row)?;
+                }
+            }
+            valid
+        };
+        if matched {
+            write.commit()?;
+        } else {
+            write.abort()?;
+        }
+        Ok(matched)
+    }
+
+    pub fn delete_batch_if_unchanged(&self, expected: &[CultCacheEnvelope]) -> Result<bool> {
+        if expected.is_empty() {
+            return Err(anyhow!(
+                "conditional delete requires a non-empty expected set"
+            ));
+        }
+        let expected_ids = unique_batch_ids(expected, "delete expected")?;
+        let write = self.inner.database.begin_write()?;
+        let matched = {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            let mut valid = true;
+            for row in expected {
+                if read_redb_entry(&table, row)? != Some(row.clone()) {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                for identity in expected_ids {
+                    let key = rmp_serde::to_vec(&identity)
+                        .context("failed to encode CultCache identity")?;
+                    table.remove(key.as_slice())?;
+                }
+            }
+            valid
+        };
+        if matched {
+            write.commit()?;
+        } else {
+            write.abort()?;
+        }
+        Ok(matched)
+    }
+}
+
+impl CacheBackingStore for OwnedRedbMessagePackBackingStore {
+    fn pull_all(&self) -> Result<Vec<CultCacheEnvelope>> {
+        let read = self.inner.database.begin_read()?;
+        let table = read.open_table(REDB_ENVELOPES)?;
+        read_all_redb(&table)
+    }
+
+    fn push(&mut self, entry: &CultCacheEnvelope) -> Result<()> {
+        let write = self.inner.database.begin_write()?;
+        {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            insert_redb_entry(&mut table, entry)?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    fn delete(&mut self, entry: &CultCacheEnvelope) -> Result<()> {
+        let write = self.inner.database.begin_write()?;
+        {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            let key = redb_identity(entry)?;
+            table.remove(key.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    fn push_all(&mut self, entries: &[CultCacheEnvelope], _options: PushAllOptions) -> Result<()> {
+        unique_batch_ids(entries, "push all")?;
+        let write = self.inner.database.begin_write()?;
+        {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            let keys = table
+                .iter()?
+                .map(|row| Ok(row?.0.value().to_vec()))
+                .collect::<Result<Vec<_>>>()?;
+            for key in keys {
+                table.remove(key.as_slice())?;
+            }
+            for entry in entries {
+                insert_redb_entry(&mut table, entry)?;
+            }
+        }
+        write.commit()?;
+        Ok(())
+    }
+}
+
+fn redb_lock_path(path: &Path) -> PathBuf {
+    let mut lock_name = path
+        .file_name()
+        .map(|value| value.to_os_string())
+        .unwrap_or_else(|| "cultcache.cc".into());
+    lock_name.push(".lock");
+    path.with_file_name(lock_name)
+}
+
+#[cfg(unix)]
+fn file_identity_from_file(file: &File) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    Ok(format!(
+        "unix:{:016x}:{:016x}",
+        metadata.dev(),
+        metadata.ino()
+    ))
+}
+
+#[cfg(windows)]
+fn file_identity_from_file(file: &File) -> Result<String> {
+    use std::mem::zeroed;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+    let success =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) };
+    if success == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to read Windows file identity");
+    }
+    let index = ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64;
+    Ok(format!(
+        "windows:{:08x}:{index:016x}",
+        information.dwVolumeSerialNumber
+    ))
+}
+
 fn redb_identity(entry: &CultCacheEnvelope) -> Result<Vec<u8>> {
     rmp_serde::to_vec(&entry_id(entry)).context("failed to encode CultCache identity")
 }
@@ -1723,6 +2101,94 @@ mod tests {
         let replacement = test_envelope("model", "current", b"two");
         assert!(second.compare_and_swap_entry(&initial, replacement.clone())?);
         assert_eq!(first.pull_all()?, vec![replacement]);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_redb_clones_share_authority_and_fresh_owner_is_refused() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("owned.cc");
+        let owner = OwnedRedbMessagePackBackingStore::new(&path)?;
+        let clone = owner.clone();
+        assert_eq!(owner.file_identity(), clone.file_identity());
+        assert!(OwnedRedbMessagePackBackingStore::new(&path).is_err());
+        drop(owner);
+        assert!(OwnedRedbMessagePackBackingStore::new(&path).is_err());
+        drop(clone);
+        assert!(OwnedRedbMessagePackBackingStore::new(&path).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn owned_redb_file_identity_is_stable_across_writes_and_reopen() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("identity.cc");
+        let identity = {
+            let mut owner = OwnedRedbMessagePackBackingStore::new(&path)?;
+            let identity = owner.file_identity().to_string();
+            owner.push(&test_envelope("model", "current", b"one"))?;
+            owner.validate_path_identity()?;
+            owner.require_file_identity(&identity)?;
+            identity
+        };
+        let reopened = OwnedRedbMessagePackBackingStore::new(&path)?;
+        assert_eq!(reopened.file_identity(), identity);
+        assert_eq!(reopened.pull_all()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_redb_identity_helper_refuses_mismatch() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let owner = OwnedRedbMessagePackBackingStore::new(temp.path().join("mismatch.cc"))?;
+        assert!(owner.require_file_identity("not-the-owned-file").is_err());
+        owner.require_file_identity(owner.file_identity())?;
+        Ok(())
+    }
+
+    #[test]
+    fn owned_redb_batch_refuses_stale_member_and_commits_success_atomically() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut owner = OwnedRedbMessagePackBackingStore::new(temp.path().join("batch-owned.cc"))?;
+        let first = test_envelope("model", "first", b"one");
+        let second = test_envelope("model", "second", b"one");
+        owner.push(&first)?;
+        owner.push(&second)?;
+        let first_two = test_envelope("model", "first", b"two");
+        let second_two = test_envelope("model", "second", b"two");
+        let companion = test_envelope("receipt", "batch", b"committed");
+        let stale_second = test_envelope("model", "second", b"stale");
+        assert!(!owner.compare_and_swap_batch(
+            &[first.clone(), stale_second],
+            vec![first_two.clone(), second_two.clone(), companion.clone()],
+        )?);
+        assert_eq!(owner.pull_all()?, vec![first.clone(), second.clone()]);
+        assert!(owner.compare_and_swap_batch(
+            &[first, second],
+            vec![first_two.clone(), second_two.clone(), companion.clone()],
+        )?);
+        assert_eq!(owner.pull_all()?, vec![first_two, second_two, companion]);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_redb_path_replacement_cannot_redirect_pinned_authority() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("pinned.cc");
+        let displaced = temp.path().join("displaced.cc");
+        let mut owner = OwnedRedbMessagePackBackingStore::new(&path)?;
+        let identity = owner.file_identity().to_string();
+        owner.push(&test_envelope("model", "before", b"one"))?;
+        fs::rename(&path, &displaced)?;
+        File::create(&path)?;
+        assert!(owner.validate_path_identity().is_err());
+        assert_eq!(owner.file_identity(), identity);
+        owner.push(&test_envelope("model", "after", b"two"))?;
+        assert_eq!(owner.pull_all()?.len(), 2);
+        assert_ne!(
+            file_identity_from_file(&File::open(&path)?)?,
+            owner.file_identity()
+        );
         Ok(())
     }
 
