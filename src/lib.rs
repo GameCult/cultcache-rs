@@ -1685,6 +1685,32 @@ impl CultCache {
     }
 
     pub fn put_envelope<T: DatabaseEntry>(&mut self, entry: CultCacheEnvelope) -> Result<T> {
+        let parsed = self.validate_envelope::<T>(&entry)?;
+        let route = self.resolve_route_indices(T::TYPE);
+        let Some(primary_index) = route.first().copied() else {
+            return Err(anyhow!(
+                "No backing store is registered for entry type {:?}",
+                T::TYPE
+            ));
+        };
+        self.stores[primary_index].store.push(&entry)?;
+        for mirror_index in route.iter().skip(1).copied() {
+            self.stores[mirror_index].store.push(&entry)?;
+        }
+        self.entries.insert(entry_id(&entry), entry);
+        Ok(parsed)
+    }
+
+    /// Validates and admits an existing envelope into this cache image without
+    /// publishing it to any backing store. This is the typed read primitive for
+    /// owner-filtered views over a shared polymorphic store.
+    pub fn load_envelope<T: DatabaseEntry>(&mut self, entry: CultCacheEnvelope) -> Result<T> {
+        let parsed = self.validate_envelope::<T>(&entry)?;
+        self.entries.insert(entry_id(&entry), entry);
+        Ok(parsed)
+    }
+
+    fn validate_envelope<T: DatabaseEntry>(&self, entry: &CultCacheEnvelope) -> Result<T> {
         self.require_entry_type::<T>()?;
         if entry.r#type != T::TYPE {
             return Err(anyhow!(
@@ -1706,27 +1732,14 @@ impl CultCache {
             ));
         }
 
-        let parsed: T = rmp_serde::from_slice(&entry.payload).with_context(|| {
+        rmp_serde::from_slice(&entry.payload).with_context(|| {
             format!(
                 "failed to validate CultCache envelope {:?} at key {:?} as {}",
                 T::TYPE,
                 entry.key,
                 T::SCHEMA_NAME
             )
-        })?;
-        let route = self.resolve_route_indices(T::TYPE);
-        let Some(primary_index) = route.first().copied() else {
-            return Err(anyhow!(
-                "No backing store is registered for entry type {:?}",
-                T::TYPE
-            ));
-        };
-        self.stores[primary_index].store.push(&entry)?;
-        for mirror_index in route.iter().skip(1).copied() {
-            self.stores[mirror_index].store.push(&entry)?;
-        }
-        self.entries.insert(entry_id(&entry), entry);
-        Ok(parsed)
+        })
     }
 
     pub fn update<T, F>(&mut self, key: &str, updater: F) -> Result<T>
