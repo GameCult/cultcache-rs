@@ -487,6 +487,18 @@ impl SingleFileMessagePackBackingStore {
             .with_context(|| format!("failed to decode MessagePack {}", self.path.display()))
     }
 
+    /// Reads one filesystem snapshot without creating or opening the sibling
+    /// CultCache lock file.
+    ///
+    /// This is deliberately narrower than `pull_all`: use it only at a
+    /// provider-owned, read-only crossing where the producer replaces the
+    /// complete file atomically and the consumer has no authority to mutate
+    /// the provider directory. An absent file is an empty snapshot. Writers
+    /// and locally owned stores must continue to use the locked APIs.
+    pub fn pull_all_read_only_snapshot(&self) -> Result<Vec<CultCacheEnvelope>> {
+        self.read_all_unlocked()
+    }
+
     fn write_all_unlocked(&self, entries: &[CultCacheEnvelope]) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)
@@ -2067,6 +2079,21 @@ mod tests {
         assert!(store.pull_all()?.is_empty());
         assert!(!missing_parent.exists());
         assert!(!store_path.with_file_name("cache.cc.lock").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn provider_snapshot_read_does_not_create_or_open_a_lock() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("provider.cc");
+        let lock_path = temp.path().join("provider.cc.lock");
+        let mut store = SingleFileMessagePackBackingStore::new(&store_path);
+        let expected = test_envelope("provider.delivery", "one", b"payload");
+        store.push(&expected)?;
+        std::fs::remove_file(&lock_path)?;
+
+        assert_eq!(store.pull_all_read_only_snapshot()?, vec![expected]);
+        assert!(!lock_path.exists());
         Ok(())
     }
 
