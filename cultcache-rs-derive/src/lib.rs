@@ -75,6 +75,7 @@ pub fn derive_database_entry(input: TokenStream) -> TokenStream {
         };
         let mut key: Option<usize> = None;
         let mut default = false;
+        let mut bytes = false;
         for attribute in field
             .attrs
             .iter()
@@ -87,6 +88,9 @@ pub fn derive_database_entry(input: TokenStream) -> TokenStream {
                     Ok(())
                 } else if meta.path.is_ident("default") {
                     default = true;
+                    Ok(())
+                } else if meta.path.is_ident("bytes") {
+                    bytes = true;
                     Ok(())
                 } else {
                     Err(meta.error("unsupported field cultcache attribute"))
@@ -117,6 +121,7 @@ pub fn derive_database_entry(input: TokenStream) -> TokenStream {
             ident: field_ident,
             ty: field.ty,
             default,
+            bytes,
         });
     }
     slots.sort_by_key(|slot| slot.key);
@@ -125,8 +130,14 @@ pub fn derive_database_entry(input: TokenStream) -> TokenStream {
     let serialize_elements = (0..=max_slot).map(|slot| {
         if let Some(field) = slots.iter().find(|field| field.key == slot) {
             let field_ident = &field.ident;
-            quote! {
-                tuple.serialize_element(&self.#field_ident)?;
+            if field.bytes {
+                quote! {
+                    tuple.serialize_element(::serde_bytes::Bytes::new(&self.#field_ident))?;
+                }
+            } else {
+                quote! {
+                    tuple.serialize_element(&self.#field_ident)?;
+                }
             }
         } else {
             quote! {
@@ -138,8 +149,14 @@ pub fn derive_database_entry(input: TokenStream) -> TokenStream {
     let option_declarations = slots.iter().map(|field| {
         let variable = format_ident!("slot_{}", field.key);
         let ty = &field.ty;
-        quote! {
-            let mut #variable: ::std::option::Option<#ty> = ::std::option::Option::None;
+        if field.bytes {
+            quote! {
+                let mut #variable: ::std::option::Option<::serde_bytes::ByteBuf> = ::std::option::Option::None;
+            }
+        } else {
+            quote! {
+                let mut #variable: ::std::option::Option<#ty> = ::std::option::Option::None;
+            }
         }
     });
 
@@ -147,9 +164,17 @@ pub fn derive_database_entry(input: TokenStream) -> TokenStream {
         if let Some(field) = slots.iter().find(|field| field.key == slot) {
             let variable = format_ident!("slot_{}", field.key);
             let ty = &field.ty;
-            quote! {
-                #slot => {
-                    #variable = seq.next_element::<#ty>()?;
+            if field.bytes {
+                quote! {
+                    #slot => {
+                        #variable = seq.next_element::<::serde_bytes::ByteBuf>()?;
+                    }
+                }
+            } else {
+                quote! {
+                    #slot => {
+                        #variable = seq.next_element::<#ty>()?;
+                    }
                 }
             }
         } else {
@@ -164,7 +189,16 @@ pub fn derive_database_entry(input: TokenStream) -> TokenStream {
     let build_fields = slots.iter().map(|field| {
         let field_ident = &field.ident;
         let variable = format_ident!("slot_{}", field.key);
-        if field.default {
+        if field.bytes && field.default {
+            quote! {
+                #field_ident: #variable.unwrap_or_default().into_vec()
+            }
+        } else if field.bytes {
+            let field_name = field_ident.to_string();
+            quote! {
+                #field_ident: #variable.ok_or_else(|| ::serde::de::Error::missing_field(#field_name))?.into_vec()
+            }
+        } else if field.default {
             quote! {
                 #field_ident: #variable.unwrap_or_default()
             }
@@ -240,4 +274,5 @@ struct CultCacheSlot {
     ident: syn::Ident,
     ty: Type,
     default: bool,
+    bytes: bool,
 }
