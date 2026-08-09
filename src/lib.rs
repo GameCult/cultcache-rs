@@ -473,6 +473,59 @@ impl SingleFileMessagePackBackingStore {
         })
     }
 
+    /// Atomically replaces and deletes rows only while the complete store
+    /// snapshot remains byte-exact. This is the single-file compaction
+    /// primitive: summary publication and history deletion share one write.
+    pub fn replace_and_delete_if_snapshot_unchanged(
+        &self,
+        expected_snapshot: &[CultCacheEnvelope],
+        replacements: Vec<CultCacheEnvelope>,
+        deletions: &[CultCacheEnvelope],
+    ) -> Result<bool> {
+        if replacements.is_empty() || deletions.is_empty() {
+            return Err(anyhow!(
+                "conditional compaction requires replacements and deletions"
+            ));
+        }
+        let expected_ids = unique_batch_ids(expected_snapshot, "expected snapshot")?;
+        let replacement_ids = unique_batch_ids(&replacements, "replacement")?;
+        let deletion_ids = unique_batch_ids(deletions, "deletion")?;
+        if !deletion_ids.is_subset(&expected_ids) {
+            return Err(anyhow!(
+                "compaction deletion is absent from expected snapshot"
+            ));
+        }
+        if !deletion_ids.is_disjoint(&replacement_ids) {
+            return Err(anyhow!("compaction cannot replace and delete one identity"));
+        }
+        self.with_exclusive_lock(|| {
+            let mut current = self.read_all_unlocked()?;
+            let mut expected = expected_snapshot.to_vec();
+            current.sort_by_key(entry_id);
+            expected.sort_by_key(entry_id);
+            if current != expected {
+                return Ok(false);
+            }
+            for row in &replacements {
+                if !expected_ids.contains(&entry_id(row))
+                    && current
+                        .iter()
+                        .any(|candidate| entry_id(candidate) == entry_id(row))
+                {
+                    return Ok(false);
+                }
+            }
+            current.retain(|row| !deletion_ids.contains(&entry_id(row)));
+            for row in replacements {
+                current.retain(|candidate| entry_id(candidate) != entry_id(&row));
+                current.push(row);
+            }
+            current.sort_by_key(entry_id);
+            self.write_all_unlocked(&current)?;
+            Ok(true)
+        })
+    }
+
     fn read_all_unlocked(&self) -> Result<Vec<CultCacheEnvelope>> {
         if !self.path.exists() {
             return Ok(Vec::new());
@@ -2468,6 +2521,35 @@ mod tests {
                 .is_err()
         );
         assert!(!store.path().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn single_file_compaction_atomically_replaces_summary_and_deletes_history() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("conditional-compaction.cc");
+        let mut store = SingleFileMessagePackBackingStore::new(&store_path);
+        let history = test_envelope("history", "old", b"closed");
+        let head = test_envelope("retention", "head", b"revision-1");
+        store.push(&history)?;
+        store.push(&head)?;
+        let snapshot = store.pull_all()?;
+        let next_head = test_envelope("retention", "head", b"revision-2");
+
+        assert!(store.replace_and_delete_if_snapshot_unchanged(
+            &snapshot,
+            vec![next_head.clone()],
+            std::slice::from_ref(&history),
+        )?);
+        assert_eq!(store.pull_all()?, vec![next_head]);
+
+        let before = fs::read(&store_path)?;
+        assert!(!store.replace_and_delete_if_snapshot_unchanged(
+            &snapshot,
+            vec![test_envelope("retention", "head", b"revision-3")],
+            std::slice::from_ref(&history),
+        )?);
+        assert_eq!(fs::read(&store_path)?, before);
         Ok(())
     }
 
