@@ -473,6 +473,36 @@ impl SingleFileMessagePackBackingStore {
         })
     }
 
+    /// Atomically replaces existing rows and appends companion rows only while
+    /// the complete backing-store snapshot remains byte-exact.
+    pub fn replace_and_append_if_snapshot_unchanged(
+        &self,
+        expected_snapshot: &[CultCacheEnvelope],
+        replacements: Vec<CultCacheEnvelope>,
+    ) -> Result<bool> {
+        if replacements.is_empty() {
+            return Err(anyhow!(
+                "conditional snapshot replacement requires replacements"
+            ));
+        }
+        unique_batch_ids(expected_snapshot, "expected snapshot")?;
+        let replacement_ids = unique_batch_ids(&replacements, "snapshot replacements")?;
+        self.with_exclusive_lock(|| {
+            let mut current = self.read_all_unlocked()?;
+            let mut expected = expected_snapshot.to_vec();
+            current.sort_by_key(entry_id);
+            expected.sort_by_key(entry_id);
+            if current != expected {
+                return Ok(false);
+            }
+            current.retain(|row| !replacement_ids.contains(&entry_id(row)));
+            current.extend(replacements);
+            current.sort_by_key(entry_id);
+            self.write_all_unlocked(&current)?;
+            Ok(true)
+        })
+    }
+
     /// Atomically replaces and deletes rows only while the complete store
     /// snapshot remains byte-exact. This is the single-file compaction
     /// primitive: summary publication and history deletion share one write.
@@ -900,6 +930,43 @@ impl RedbMessagePackBackingStore {
         })
     }
 
+    pub fn replace_and_append_if_snapshot_unchanged(
+        &self,
+        expected_snapshot: &[CultCacheEnvelope],
+        replacements: Vec<CultCacheEnvelope>,
+    ) -> Result<bool> {
+        if replacements.is_empty() {
+            return Err(anyhow!(
+                "conditional snapshot replacement requires replacements"
+            ));
+        }
+        unique_batch_ids(expected_snapshot, "expected snapshot")?;
+        unique_batch_ids(&replacements, "snapshot replacements")?;
+        self.with_database(|database| {
+            let write = database.begin_write()?;
+            let matched = {
+                let mut table = write.open_table(REDB_ENVELOPES)?;
+                let mut current = read_all_redb(&table)?;
+                let mut expected = expected_snapshot.to_vec();
+                current.sort_by_key(entry_id);
+                expected.sort_by_key(entry_id);
+                let valid = current == expected;
+                if valid {
+                    for row in &replacements {
+                        insert_redb_entry(&mut table, row)?;
+                    }
+                }
+                valid
+            };
+            if matched {
+                write.commit()?;
+            } else {
+                write.abort()?;
+            }
+            Ok(matched)
+        })
+    }
+
     /// Atomically replaces and deletes rows only while the complete store
     /// snapshot remains byte-exact. This is the compaction primitive for a
     /// non-owning keyed handle: a stale reader cannot summarize one history
@@ -1240,6 +1307,41 @@ impl OwnedRedbMessagePackBackingStore {
                     .any(|row| addition_ids.contains(&entry_id(row)));
             if valid {
                 for row in &additions {
+                    insert_redb_entry(&mut table, row)?;
+                }
+            }
+            valid
+        };
+        if matched {
+            write.commit()?;
+        } else {
+            write.abort()?;
+        }
+        Ok(matched)
+    }
+
+    pub fn replace_and_append_if_snapshot_unchanged(
+        &self,
+        expected_snapshot: &[CultCacheEnvelope],
+        replacements: Vec<CultCacheEnvelope>,
+    ) -> Result<bool> {
+        if replacements.is_empty() {
+            return Err(anyhow!(
+                "conditional snapshot replacement requires replacements"
+            ));
+        }
+        unique_batch_ids(expected_snapshot, "expected snapshot")?;
+        unique_batch_ids(&replacements, "snapshot replacements")?;
+        let write = self.inner.database.begin_write()?;
+        let matched = {
+            let mut table = write.open_table(REDB_ENVELOPES)?;
+            let mut current = read_all_redb(&table)?;
+            let mut expected = expected_snapshot.to_vec();
+            current.sort_by_key(entry_id);
+            expected.sort_by_key(entry_id);
+            let valid = current == expected;
+            if valid {
+                for row in &replacements {
                     insert_redb_entry(&mut table, row)?;
                 }
             }
@@ -2615,6 +2717,54 @@ mod tests {
                 .is_err()
         );
         assert!(!store.path().exists());
+        Ok(())
+    }
+
+    #[test]
+    fn full_snapshot_replacement_and_append_refuses_concurrent_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let snapshot_path = temp.path().join("snapshot-replace-append.cc");
+        let mut snapshot_store = SingleFileMessagePackBackingStore::new(&snapshot_path);
+        let current = test_envelope("session", "current", b"active");
+        snapshot_store.push(&current)?;
+        let stale_snapshot = snapshot_store.pull_all()?;
+        let concurrent = test_envelope("event", "concurrent", b"live");
+        snapshot_store.push(&concurrent)?;
+        let completed = test_envelope("session", "current", b"completed");
+        let receipt = test_envelope("receipt", "terminal", b"done");
+        assert!(!snapshot_store.replace_and_append_if_snapshot_unchanged(
+            &stale_snapshot,
+            vec![completed.clone(), receipt.clone()],
+        )?);
+        assert_eq!(snapshot_store.pull_all()?, vec![concurrent.clone(), current.clone()]);
+        let exact_snapshot = snapshot_store.pull_all()?;
+        assert!(snapshot_store.replace_and_append_if_snapshot_unchanged(
+            &exact_snapshot,
+            vec![completed.clone(), receipt.clone()],
+        )?);
+        assert_eq!(
+            snapshot_store.pull_all()?,
+            vec![concurrent.clone(), receipt.clone(), completed.clone()]
+        );
+
+        let keyed_path = temp.path().join("keyed-replace-append.redb");
+        let mut keyed_store = RedbMessagePackBackingStore::new(&keyed_path)?;
+        keyed_store.push(&current)?;
+        let stale_snapshot = keyed_store.pull_all()?;
+        keyed_store.push(&concurrent)?;
+        assert!(!keyed_store.replace_and_append_if_snapshot_unchanged(
+            &stale_snapshot,
+            vec![completed.clone(), receipt.clone()],
+        )?);
+        let exact_snapshot = keyed_store.pull_all()?;
+        assert!(keyed_store.replace_and_append_if_snapshot_unchanged(
+            &exact_snapshot,
+            vec![completed.clone(), receipt.clone()],
+        )?);
+        assert_eq!(
+            keyed_store.pull_all()?,
+            vec![concurrent, receipt, completed]
+        );
         Ok(())
     }
 
