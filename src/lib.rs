@@ -587,6 +587,7 @@ impl SingleFileMessagePackBackingStore {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
+        remove_abandoned_staging_files(&self.path)?;
         let bytes = rmp_serde::to_vec(&encode_store_snapshot(entries))
             .context("failed to encode MessagePack")?;
         let tmp_path = temporary_path_for(&self.path);
@@ -2160,6 +2161,38 @@ fn temporary_path_for(path: &Path) -> PathBuf {
     path.with_file_name(file_name)
 }
 
+fn remove_abandoned_staging_files(destination: &Path) -> Result<()> {
+    let Some(parent) = destination.parent() else {
+        return Ok(());
+    };
+    let Some(destination_name) = destination.file_name().and_then(|value| value.to_str()) else {
+        return Ok(());
+    };
+    let prefix = format!("{destination_name}.");
+    for entry in fs::read_dir(parent)
+        .with_context(|| format!("failed to inspect {} for abandoned staging files", parent.display()))?
+    {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(candidate) = name
+            .strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix(".tmp"))
+        else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(candidate).is_err()
+            || !entry.file_type()?.is_file()
+        {
+            continue;
+        }
+        fs::remove_file(entry.path())
+            .with_context(|| format!("failed to remove abandoned staging file {}", entry.path().display()))?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn replace_file_atomically(staged: &Path, destination: &Path) -> Result<()> {
     fs::rename(staged, destination).with_context(|| {
@@ -2393,6 +2426,28 @@ mod tests {
 
         assert_eq!(store.pull_all_read_only_snapshot()?, vec![expected]);
         assert!(!lock_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn next_exclusive_write_removes_only_exact_abandoned_staging_files() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("cache.cc");
+        let abandoned = temporary_path_for(&store_path);
+        let unknown = temp.path().join("cache.cc.not-a-uuid.tmp");
+        let foreign = temp.path().join("other.cc.00000000-0000-0000-0000-000000000000.tmp");
+        fs::write(&abandoned, b"partial staging bytes")?;
+        fs::write(&unknown, b"operator-owned unknown file")?;
+        fs::write(&foreign, b"foreign store staging")?;
+
+        let mut store = SingleFileMessagePackBackingStore::new(&store_path);
+        let expected = test_envelope("model", "current", b"one");
+        store.push(&expected)?;
+
+        assert!(!abandoned.exists());
+        assert_eq!(fs::read(&unknown)?, b"operator-owned unknown file");
+        assert_eq!(fs::read(&foreign)?, b"foreign store staging");
+        assert_eq!(store.pull_all()?, vec![expected]);
         Ok(())
     }
 
