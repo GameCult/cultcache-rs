@@ -590,19 +590,21 @@ impl SingleFileMessagePackBackingStore {
         let bytes = rmp_serde::to_vec(&encode_store_snapshot(entries))
             .context("failed to encode MessagePack")?;
         let tmp_path = temporary_path_for(&self.path);
-        fs::write(&tmp_path, bytes)
+        let mut staged = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)
+            .with_context(|| format!("failed to create {}", tmp_path.display()))?;
+        use std::io::Write;
+        staged
+            .write_all(&bytes)
             .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-        if self.path.exists() {
-            fs::remove_file(&self.path)
-                .with_context(|| format!("failed to replace {}", self.path.display()))?;
-        }
-        fs::rename(&tmp_path, &self.path).with_context(|| {
-            format!(
-                "failed to move {} to {}",
-                tmp_path.display(),
-                self.path.display()
-            )
-        })?;
+        staged
+            .sync_all()
+            .with_context(|| format!("failed to sync {}", tmp_path.display()))?;
+        drop(staged);
+        replace_file_atomically(&tmp_path, &self.path)?;
+        sync_parent_directory(&self.path)?;
         Ok(())
     }
 
@@ -2158,6 +2160,69 @@ fn temporary_path_for(path: &Path) -> PathBuf {
     path.with_file_name(file_name)
 }
 
+#[cfg(unix)]
+fn replace_file_atomically(staged: &Path, destination: &Path) -> Result<()> {
+    fs::rename(staged, destination).with_context(|| {
+        format!(
+            "failed to atomically replace {} with {}",
+            destination.display(),
+            staged.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(staged: &Path, destination: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let staged_wide = staged
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let success = unsafe {
+        MoveFileExW(
+            staged_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if success == 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to atomically replace {} with {}",
+                destination.display(),
+                staged.display()
+            )
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("failed to sync {}", parent.display()))
+}
+
+#[cfg(windows)]
+fn sync_parent_directory(_path: &Path) -> Result<()> {
+    // MoveFileExW with MOVEFILE_WRITE_THROUGH owns publication durability.
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2328,6 +2393,69 @@ mod tests {
 
         assert_eq!(store.pull_all_read_only_snapshot()?, vec![expected]);
         assert!(!lock_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_snapshot_publication_preserves_the_committed_destination() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let destination = temp.path().join("cache.cc");
+        let absent_staging = temp.path().join("absent.tmp");
+        let committed = b"committed snapshot";
+        fs::write(&destination, committed)?;
+
+        assert!(replace_file_atomically(&absent_staging, &destination).is_err());
+        assert_eq!(fs::read(&destination)?, committed);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_publication_atomically_replaces_an_existing_destination() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let destination = temp.path().join("cache.cc");
+        let staged = temp.path().join("cache.cc.staged");
+        fs::write(&destination, b"old snapshot")?;
+        fs::write(&staged, b"new snapshot")?;
+
+        replace_file_atomically(&staged, &destination)?;
+
+        assert_eq!(fs::read(&destination)?, b"new snapshot");
+        assert!(!staged.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "operator SIGKILL probe; requires CULTCACHE_INTERRUPTION_STORE"]
+    fn snapshot_publication_interruption_probe_writer() -> Result<()> {
+        let store_path = std::env::var_os("CULTCACHE_INTERRUPTION_STORE")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("CULTCACHE_INTERRUPTION_STORE is required"))?;
+        let marker_path = std::env::var_os("CULTCACHE_INTERRUPTION_MARKER")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("CULTCACHE_INTERRUPTION_MARKER is required"))?;
+        let mut store = SingleFileMessagePackBackingStore::new(store_path);
+        for sequence in 0_u64.. {
+            store.push(&test_envelope(
+                "interruption.probe",
+                "current",
+                &rmp_serde::to_vec(&sequence)?,
+            ))?;
+            fs::write(&marker_path, sequence.to_string())?;
+        }
+        unreachable!("the interruption writer is stopped by the operator")
+    }
+
+    #[test]
+    #[ignore = "operator SIGKILL probe; requires CULTCACHE_INTERRUPTION_STORE"]
+    fn snapshot_publication_interruption_probe_reader() -> Result<()> {
+        let store_path = std::env::var_os("CULTCACHE_INTERRUPTION_STORE")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("CULTCACHE_INTERRUPTION_STORE is required"))?;
+        let rows = SingleFileMessagePackBackingStore::new(store_path).pull_all()?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].r#type, "interruption.probe");
+        assert_eq!(rows[0].key, "current");
+        let _: u64 = rmp_serde::from_slice(&rows[0].payload)?;
         Ok(())
     }
 
@@ -2736,7 +2864,10 @@ mod tests {
             &stale_snapshot,
             vec![completed.clone(), receipt.clone()],
         )?);
-        assert_eq!(snapshot_store.pull_all()?, vec![concurrent.clone(), current.clone()]);
+        assert_eq!(
+            snapshot_store.pull_all()?,
+            vec![concurrent.clone(), current.clone()]
+        );
         let exact_snapshot = snapshot_store.pull_all()?;
         assert!(snapshot_store.replace_and_append_if_snapshot_unchanged(
             &exact_snapshot,
