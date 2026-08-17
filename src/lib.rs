@@ -1849,6 +1849,36 @@ impl CultCache {
                 T::SCHEMA_NAME
             )
         })?;
+        self.finish_prepared_entry::<T>(key, payload)
+    }
+
+    /// Prepares a typed entry while encoding ordinary nested structs as
+    /// MessagePack maps. DatabaseEntry itself remains the stable numeric-slot
+    /// tuple; named nested fields prevent serde's omitted optional fields from
+    /// shifting later values into the wrong positions.
+    pub fn prepare_entry_named<T: DatabaseEntry>(
+        &self,
+        key: impl Into<String>,
+        value: &T,
+    ) -> Result<(CultCacheEnvelope, T)> {
+        self.require_entry_type::<T>()?;
+        let key = key.into();
+        let payload = rmp_serde::to_vec_named(value).with_context(|| {
+            format!(
+                "failed to encode named CultCache entry {:?} at key {:?} as {}",
+                T::TYPE,
+                key,
+                T::SCHEMA_NAME
+            )
+        })?;
+        self.finish_prepared_entry::<T>(key, payload)
+    }
+
+    fn finish_prepared_entry<T: DatabaseEntry>(
+        &self,
+        key: String,
+        payload: Vec<u8>,
+    ) -> Result<(CultCacheEnvelope, T)> {
         let parsed: T = rmp_serde::from_slice(&payload).with_context(|| {
             format!(
                 "failed to validate CultCache entry {:?} at key {:?} as {}",
@@ -2169,9 +2199,12 @@ fn remove_abandoned_staging_files(destination: &Path) -> Result<()> {
         return Ok(());
     };
     let prefix = format!("{destination_name}.");
-    for entry in fs::read_dir(parent)
-        .with_context(|| format!("failed to inspect {} for abandoned staging files", parent.display()))?
-    {
+    for entry in fs::read_dir(parent).with_context(|| {
+        format!(
+            "failed to inspect {} for abandoned staging files",
+            parent.display()
+        )
+    })? {
         let entry = entry?;
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
@@ -2182,13 +2215,15 @@ fn remove_abandoned_staging_files(destination: &Path) -> Result<()> {
         else {
             continue;
         };
-        if uuid::Uuid::parse_str(candidate).is_err()
-            || !entry.file_type()?.is_file()
-        {
+        if uuid::Uuid::parse_str(candidate).is_err() || !entry.file_type()?.is_file() {
             continue;
         }
-        fs::remove_file(entry.path())
-            .with_context(|| format!("failed to remove abandoned staging file {}", entry.path().display()))?;
+        fs::remove_file(entry.path()).with_context(|| {
+            format!(
+                "failed to remove abandoned staging file {}",
+                entry.path().display()
+            )
+        })?;
     }
     Ok(())
 }
@@ -2308,6 +2343,22 @@ mod tests {
         body: String,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    struct NestedOptionalValue {
+        label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        count: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        symbol: Option<String>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
+    #[cultcache(type = "nested-note")]
+    struct NestedNote {
+        #[cultcache(key = 0)]
+        value: NestedOptionalValue,
+    }
+
     cultcache_soa!(Settings {
         "theme" => |row: &Settings| row.theme.clone(),
         "retries" => |row: &Settings| row.retries,
@@ -2402,6 +2453,29 @@ mod tests {
     }
 
     #[test]
+    fn named_preparation_preserves_omitted_nested_optional_slots() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("named.cc");
+        let mut cache = CultCache::new();
+        cache.register_entry_type::<NestedNote>()?;
+        cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
+        cache.pull_all_backing_stores()?;
+        let note = NestedNote {
+            value: NestedOptionalValue {
+                label: "nested".into(),
+                count: None,
+                symbol: Some("kept-in-its-own-field".into()),
+            },
+        };
+        assert!(cache.prepare_entry("compact", &note).is_err());
+        let (entry, parsed) = cache.prepare_entry_named("named", &note)?;
+        assert_eq!(parsed, note);
+        cache.put_prepared_batch(vec![entry])?;
+        assert_eq!(cache.get_required::<NestedNote>("named")?, note);
+        Ok(())
+    }
+
+    #[test]
     fn pulling_an_absent_store_does_not_create_its_parent_or_lock() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let missing_parent = temp.path().join("missing-body");
@@ -2435,7 +2509,9 @@ mod tests {
         let store_path = temp.path().join("cache.cc");
         let abandoned = temporary_path_for(&store_path);
         let unknown = temp.path().join("cache.cc.not-a-uuid.tmp");
-        let foreign = temp.path().join("other.cc.00000000-0000-0000-0000-000000000000.tmp");
+        let foreign = temp
+            .path()
+            .join("other.cc.00000000-0000-0000-0000-000000000000.tmp");
         fs::write(&abandoned, b"partial staging bytes")?;
         fs::write(&unknown, b"operator-owned unknown file")?;
         fs::write(&foreign, b"foreign store staging")?;
