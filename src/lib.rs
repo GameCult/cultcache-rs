@@ -1686,6 +1686,10 @@ impl CultCache {
         self.register_entry_type::<T>()
     }
 
+    pub fn registered_entry_types(&self) -> Vec<String> {
+        self.definitions.keys().cloned().collect()
+    }
+
     pub fn register_registry<R: CultCacheRegistry>(&mut self, registry: R) -> Result<&mut Self> {
         registry.register_entries(self)?;
         Ok(self)
