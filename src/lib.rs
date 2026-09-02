@@ -758,6 +758,15 @@ mod tests {
         body: String,
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq, DatabaseEntry)]
+    #[cultcache(type = "binary-record")]
+    struct BinaryRecord {
+        #[cultcache(key = 0, bytes)]
+        required: Vec<u8>,
+        #[cultcache(key = 1, bytes, default)]
+        optional: Vec<u8>,
+    }
+
     cultcache_registry!(TestEntries { Settings, Note });
 
     #[test]
@@ -984,6 +993,19 @@ mod tests {
         let decoded: Settings = rmp_serde::from_slice(&entry.payload)?;
         assert_eq!(decoded.theme, "ash");
         assert!(!entry.payload.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn byte_slots_use_messagepack_binary_and_round_trip() -> Result<()> {
+        let record = BinaryRecord {
+            required: vec![1, 2, 3],
+            optional: Vec::new(),
+        };
+
+        let payload = rmp_serde::to_vec(&record)?;
+        assert_eq!(payload, vec![0x92, 0xc4, 3, 1, 2, 3, 0xc4, 0]);
+        assert_eq!(rmp_serde::from_slice::<BinaryRecord>(&payload)?, record);
         Ok(())
     }
 
