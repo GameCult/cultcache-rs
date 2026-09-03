@@ -2,6 +2,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use anyhow::ensure;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::any::Any;
@@ -645,7 +646,7 @@ impl SingleFileMessagePackBackingStore {
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         remove_abandoned_staging_files(&self.path)?;
-        let bytes = rmp_serde::to_vec(&encode_store_snapshot(entries))
+        let bytes = rmp_serde::to_vec(&encode_store_snapshot(entries)?)
             .context("failed to encode MessagePack")?;
         let tmp_path = temporary_path_for(&self.path);
         let mut staged = OpenOptions::new()
@@ -2057,6 +2058,45 @@ impl CultCache {
         Ok(parsed)
     }
 
+    /// Publishes an envelope for a registered dynamic document type without
+    /// claiming compile-time knowledge of its payload schema. This is the
+    /// CultMesh/schema-registry boundary: callers own payload validation before
+    /// admission; CultCache still enforces registered type, identity, timestamp,
+    /// routing, and persistence.
+    pub fn put_raw_envelope(&mut self, entry: CultCacheEnvelope) -> Result<()> {
+        if !self.definitions.contains_key(&entry.r#type) {
+            return Err(anyhow!(
+                "No entry type registered for CultCache envelope type {:?}",
+                entry.r#type
+            ));
+        }
+        if entry.key.trim().is_empty() {
+            return Err(anyhow!(
+                "CultCache envelope keys for type {:?} must be non-empty",
+                entry.r#type
+            ));
+        }
+        if entry.stored_at.trim().is_empty() {
+            return Err(anyhow!(
+                "CultCache envelope stored_at for type {:?} must be non-empty",
+                entry.r#type
+            ));
+        }
+        let route = self.resolve_route_indices(&entry.r#type);
+        let Some(primary_index) = route.first().copied() else {
+            return Err(anyhow!(
+                "No backing store is registered for entry type {:?}",
+                entry.r#type
+            ));
+        };
+        self.stores[primary_index].store.push(&entry)?;
+        for mirror_index in route.iter().skip(1).copied() {
+            self.stores[mirror_index].store.push(&entry)?;
+        }
+        self.entries.insert(entry_id(&entry), entry);
+        Ok(())
+    }
+
     /// Validates and admits an existing envelope into this cache image without
     /// publishing it to any backing store. This is the typed read primitive for
     /// owner-filtered views over a shared polymorphic store.
@@ -2199,23 +2239,28 @@ fn now_utc_second() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-fn encode_store_snapshot(entries: &[CultCacheEnvelope]) -> PersistedStoreSnapshot {
-    let mut schema_names = BTreeSet::<String>::new();
+fn encode_store_snapshot(entries: &[CultCacheEnvelope]) -> Result<PersistedStoreSnapshot> {
+    let mut schema_types = BTreeMap::<String, String>::new();
     for entry in entries {
-        schema_names.insert(
-            entry
-                .schema_id
-                .clone()
-                .unwrap_or_else(|| entry.r#type.clone()),
-        );
+        let schema_id = entry
+            .schema_id
+            .clone()
+            .unwrap_or_else(|| entry.r#type.clone());
+        if let Some(existing_type) = schema_types.insert(schema_id.clone(), entry.r#type.clone()) {
+            ensure!(
+                existing_type == entry.r#type,
+                "CultCache schema {schema_id:?} cannot identify both {existing_type:?} and {:?}",
+                entry.r#type
+            );
+        }
     }
 
-    let catalog = schema_names
+    let catalog = schema_types
         .into_iter()
-        .map(|schema_id| {
+        .map(|(schema_id, document_type)| {
             PersistedSchemaCatalogEntry(
                 schema_id.clone(),
-                schema_id.clone(),
+                document_type,
                 format!("{schema_id}.v1"),
                 schema_id.clone(),
                 format!(
@@ -2243,7 +2288,11 @@ fn encode_store_snapshot(entries: &[CultCacheEnvelope]) -> PersistedStoreSnapsho
         })
         .collect();
 
-    PersistedStoreSnapshot("cultcache.store.v1".to_string(), catalog, records)
+    Ok(PersistedStoreSnapshot(
+        "cultcache.store.v1".to_string(),
+        catalog,
+        records,
+    ))
 }
 
 fn decode_store_snapshot(bytes: &[u8]) -> Result<Vec<CultCacheEnvelope>> {
@@ -3520,6 +3569,57 @@ mod tests {
         assert_eq!(
             target.get_required_envelope::<Settings>("app")?.payload,
             envelope.payload
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_envelope_path_preserves_a_registered_dynamic_payload() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store_path = temp.path().join("dynamic.cc");
+        let envelope = CultCacheEnvelope {
+            key: "app".to_string(),
+            r#type: Settings::TYPE.to_string(),
+            payload: vec![0xc1],
+            stored_at: now_utc_second(),
+            schema_id: Some("dynamic.settings.v1".to_string()),
+        };
+
+        let mut cache = CultCache::new();
+        cache.register_entry_type::<Settings>()?;
+        cache.register_entry_type::<Note>()?;
+        cache.add_generic_backing_store(SingleFileMessagePackBackingStore::new(&store_path));
+        cache.put_raw_envelope(envelope.clone())?;
+
+        assert_eq!(cache.snapshot(), vec![envelope.clone()]);
+        assert_eq!(
+            SingleFileMessagePackBackingStore::new(&store_path).pull_all()?,
+            vec![envelope]
+        );
+        assert!(cache.get_required::<Settings>("app").is_err());
+        let before_collision = fs::read(&store_path)?;
+        assert!(
+            cache
+                .put_raw_envelope(CultCacheEnvelope {
+                    key: "note".to_string(),
+                    r#type: Note::TYPE.to_string(),
+                    payload: Vec::new(),
+                    stored_at: now_utc_second(),
+                    schema_id: Some("dynamic.settings.v1".to_string()),
+                })
+                .is_err()
+        );
+        assert_eq!(fs::read(&store_path)?, before_collision);
+        assert!(
+            cache
+                .put_raw_envelope(CultCacheEnvelope {
+                    key: "foreign".to_string(),
+                    r#type: "unregistered".to_string(),
+                    payload: Vec::new(),
+                    stored_at: now_utc_second(),
+                    schema_id: None,
+                })
+                .is_err()
         );
         Ok(())
     }
